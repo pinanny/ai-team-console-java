@@ -23,6 +23,14 @@ class PatchParseUtilTest {
     }
 
     @Test
+    void extractsDiffFromMarkerDelimiters() {
+        String out = "prefix\n<<<DIFF>>>\ndiff --git a/x b/x\n--- a/x\n+++ b/x\n@@ -1 +1 @@\n-a\n+b\n<<<END_DIFF>>>\n";
+        String d = PatchParseUtil.extractUnifiedDiff(out);
+        assertTrue(d.startsWith("diff --git"));
+        assertTrue(d.contains("+b"));
+    }
+
+    @Test
     void stripsTrailingProseAfterDiff() {
         String out = "diff --git a/README.md b/README.md\n--- a/README.md\n+++ b/README.md\n@@ -1 +1 @@\n-old\n+new\n\nHope this helps!\n";
         String d = PatchParseUtil.extractUnifiedDiff(out);

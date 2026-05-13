@@ -9,6 +9,7 @@ import java.util.regex.Pattern;
 public final class PatchParseUtil {
 
     private static final Pattern FENCE_DIFF = Pattern.compile("```(?:diff|patch)?\\s*([\\s\\S]*?)```", Pattern.CASE_INSENSITIVE);
+    private static final Pattern MARKER_DIFF = Pattern.compile("<<<DIFF>>>([\\s\\S]*?)<<<END_DIFF>>>");
 
     private PatchParseUtil() {
     }
@@ -23,6 +24,16 @@ public final class PatchParseUtil {
         String t = modelOutput.strip();
         if (t.equals("NO_PATCH") || t.startsWith("NO_PATCH")) {
             return "";
+        }
+        Matcher markers = MARKER_DIFF.matcher(t);
+        if (markers.find()) {
+            String inner = markers.group(1).strip();
+            if (inner.equals("NO_PATCH") || inner.startsWith("NO_PATCH")) {
+                return "";
+            }
+            if (inner.startsWith("diff --git")) {
+                return prepareUnifiedDiffForGitApply(inner);
+            }
         }
         Matcher m = FENCE_DIFF.matcher(t);
         if (m.find()) {

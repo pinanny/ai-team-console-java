@@ -70,6 +70,9 @@ public final class AiTeamConsoleApplication extends Application {
     private final StateStore stateStore = StateStore.defaultStore();
     private final ProviderRegistry providerRegistry = new ProviderRegistry();
     private final CursorApiStore cursorApiStore = CursorApiStore.defaultStore();
+    private final ClaudeApiStore claudeApiStore = ClaudeApiStore.defaultStore();
+    /** Session-only Claude API key (never persisted; see {@link ClaudeApiStore}). */
+    private String claudeSessionApiKey = "";
 
     private ObservableList<AgentProfile> agents;
     private ObservableList<AgentTask> tasks;
@@ -118,7 +121,8 @@ public final class AiTeamConsoleApplication extends Application {
 
         providerRegistry.cursorCloudProvider().setRepositoryResolver(this::resolveRepositoryUrlsForTask);
         providerRegistry.ollamaProvider().setRepositoryResolver(this::resolveRepositoryUrlsForTask);
-        syncOllamaRuntimeSettings();
+        providerRegistry.claudeApiProvider().setRepositoryResolver(this::resolveRepositoryUrlsForTask);
+        syncLocalAgentRuntimeSettings();
 
         primaryStage = stage;
 
@@ -282,7 +286,7 @@ public final class AiTeamConsoleApplication extends Application {
         AgentRun toPoll = current.get();
         CompletableFuture.supplyAsync(() -> {
             try {
-                syncOllamaRuntimeSettings();
+                syncLocalAgentRuntimeSettings();
                 return providerRegistry.providerFor(toPoll.provider()).refreshRun(toPoll, currentSettings());
             } catch (AgentProviderException e) {
                 throw new RuntimeException(e);
@@ -365,13 +369,16 @@ public final class AiTeamConsoleApplication extends Application {
         Button ollamaSettingsBtn = new Button("Ollama settings…");
         ollamaSettingsBtn.setOnAction(event -> openOllamaSettingsWindow());
 
+        Button claudeApiSettingsBtn = new Button("Claude API settings…");
+        claudeApiSettingsBtn.setOnAction(event -> openClaudeApiSettingsWindow());
+
         Button githubSettingsBtn = new Button("GitHub settings…");
         githubSettingsBtn.setOnAction(event -> openGithubSettingsWindow());
 
         Button pixelOfficeBtn = new Button("Pixel Office…");
         pixelOfficeBtn.setOnAction(event -> openPixelOfficeWindow());
 
-        HBox buttonsRow = new HBox(8, cursorSettingsBtn, ollamaSettingsBtn, githubSettingsBtn, pixelOfficeBtn);
+        HBox buttonsRow = new HBox(8, cursorSettingsBtn, ollamaSettingsBtn, claudeApiSettingsBtn, githubSettingsBtn, pixelOfficeBtn);
         return new VBox(6, buttonsRow);
     }
 
@@ -541,7 +548,7 @@ public final class AiTeamConsoleApplication extends Application {
                         Integer.parseInt(chunk.getText().strip())
                 ).normalized();
                 ollamaSettingsStore.save(next);
-                syncOllamaRuntimeSettings();
+                syncLocalAgentRuntimeSettings();
                 showInfo("Saved Ollama settings to %s.".formatted(ollamaSettingsStore.filePath()));
                 dlg.close();
             } catch (NumberFormatException ex) {
@@ -582,6 +589,80 @@ public final class AiTeamConsoleApplication extends Application {
         VBox root = new VBox(12, hint, grid, save);
         root.setPadding(new Insets(16));
         dlg.setScene(new Scene(root, 560, 480));
+        dlg.show();
+    }
+
+    private void openClaudeApiSettingsWindow() {
+        Stage dlg = new Stage();
+        dlg.initOwner(primaryStage);
+        dlg.setTitle("Claude API Settings");
+
+        ClaudeApiSettings cur = claudeApiStore.load();
+        PasswordField apiKeyField = new PasswordField();
+        apiKeyField.setPromptText("sk-ant-…");
+        if (!claudeSessionApiKey.isBlank()) {
+            apiKeyField.setText(claudeSessionApiKey);
+        }
+
+        ComboBox<String> modelPick = new ComboBox<>(FXCollections.observableArrayList(
+                "claude-haiku-4-5",
+                "claude-sonnet-4-6",
+                "claude-opus-4-6"));
+        modelPick.setEditable(true);
+        String m = cur.model() == null || cur.model().isBlank() ? "claude-sonnet-4-6" : cur.model();
+        modelPick.getSelectionModel().select(m);
+        if (!modelPick.getItems().contains(m)) {
+            modelPick.getItems().add(0, m);
+            modelPick.getSelectionModel().select(0);
+        }
+
+        TextField baseUrlField = new TextField(cur.baseUrl() == null || cur.baseUrl().isBlank()
+                ? "https://api.anthropic.com"
+                : cur.baseUrl());
+
+        Button cancel = new Button("Cancel");
+        cancel.setCancelButton(true);
+        cancel.setOnAction(e -> dlg.close());
+
+        Button save = new Button("Save");
+        save.setDefaultButton(true);
+        save.setOnAction(e -> {
+            String modelText = modelPick.getEditor().getText();
+            if (modelText == null || modelText.isBlank()) {
+                modelText = modelPick.getSelectionModel().getSelectedItem();
+            }
+            ClaudeApiSettings nextDisk = new ClaudeApiSettings("", modelText == null ? "" : modelText.strip(),
+                    baseUrlField.getText() == null ? "" : baseUrlField.getText().strip());
+            claudeApiStore.save(nextDisk);
+            claudeSessionApiKey = apiKeyField.getText() == null ? "" : apiKeyField.getText().strip();
+            syncLocalAgentRuntimeSettings();
+            showInfo("Saved Claude model and base URL to %s. API key is kept in memory for this session only."
+                    .formatted(claudeApiStore.filePath()));
+            dlg.close();
+        });
+
+        Label hint = new Label(
+                "Model presets: Haiku (fast & cheap), Sonnet (balanced), Opus (most capable). "
+                        + "The API key is never written to disk — use ANTHROPIC_API_KEY or enter it here each session.");
+        hint.setWrapText(true);
+        hint.setStyle("-fx-text-fill: #666;");
+
+        GridPane grid = new GridPane();
+        grid.setHgap(8);
+        grid.setVgap(8);
+        int r = 0;
+        grid.addRow(r++, new Label("API Key"), apiKeyField);
+        grid.addRow(r++, new Label("Model"), modelPick);
+        grid.addRow(r++, new Label("Base URL"), baseUrlField);
+        GridPane.setColumnSpan(apiKeyField, 2);
+        GridPane.setColumnSpan(modelPick, 2);
+        GridPane.setColumnSpan(baseUrlField, 2);
+
+        HBox actions = new HBox(8, cancel, save);
+        actions.setAlignment(Pos.CENTER_RIGHT);
+        VBox root = new VBox(12, hint, grid, actions);
+        root.setPadding(new Insets(16));
+        dlg.setScene(new Scene(root, 480, 320));
         dlg.show();
     }
 
@@ -1353,7 +1434,7 @@ public final class AiTeamConsoleApplication extends Application {
         CompletableFuture
                 .supplyAsync(() -> {
                     try {
-                        syncOllamaRuntimeSettings();
+                        syncLocalAgentRuntimeSettings();
                         return providerRegistry.providerFor(agent.provider()).startTask(agent, queuedTask, currentSettings());
                     } catch (AgentProviderException e) {
                         throw new RuntimeException(e);
@@ -1558,7 +1639,7 @@ public final class AiTeamConsoleApplication extends Application {
         CompletableFuture
                 .supplyAsync(() -> {
                     try {
-                        syncOllamaRuntimeSettings();
+                        syncLocalAgentRuntimeSettings();
                         return providerRegistry.providerFor(selected.provider()).refreshRun(selected, currentSettings());
                     } catch (AgentProviderException e) {
                         throw new RuntimeException(e);
@@ -1577,7 +1658,7 @@ public final class AiTeamConsoleApplication extends Application {
         CompletableFuture
                 .supplyAsync(() -> {
                     try {
-                        syncOllamaRuntimeSettings();
+                        syncLocalAgentRuntimeSettings();
                         return providerRegistry.providerFor(selected.provider()).cancelRun(selected, currentSettings());
                     } catch (AgentProviderException e) {
                         throw new RuntimeException(e);
@@ -1630,9 +1711,10 @@ public final class AiTeamConsoleApplication extends Application {
         if (run.pullRequestUrl() != null && !run.pullRequestUrl().isBlank()) {
             return;
         }
-        if (run.provider() != ProviderType.CURSOR_CLOUD && run.provider() != ProviderType.OLLAMA) {
+        if (run.provider() != ProviderType.CURSOR_CLOUD && run.provider() != ProviderType.OLLAMA
+                && run.provider() != ProviderType.CLAUDE_API) {
             appendPrAutomationLog(run.id(),
-                    "Skipped opening a PR here: only Cursor Cloud and Ollama runs use GitHub PR automation in this app.");
+                    "Skipped opening a PR here: only Cursor Cloud, Ollama, and Claude API runs use GitHub PR automation in this app.");
             return;
         }
         AgentProfile agent = findAgent(run.agentProfileId()).orElse(null);
@@ -1919,6 +2001,22 @@ public final class AiTeamConsoleApplication extends Application {
         return runs.stream()
                 .filter(run -> run.taskId().equals(taskId))
                 .anyMatch(run -> !run.status().terminal());
+    }
+
+    private void syncLocalAgentRuntimeSettings() {
+        syncOllamaRuntimeSettings();
+        syncClaudeRuntimeSettings();
+    }
+
+    private void syncClaudeRuntimeSettings() {
+        providerRegistry.claudeApiProvider().setClaudeSettings(currentClaudeSettings());
+        providerRegistry.claudeApiProvider().setRuntimeSettings(ollamaSettingsStore.load());
+    }
+
+    private ClaudeApiSettings currentClaudeSettings() {
+        ClaudeApiSettings disk = claudeApiStore.load();
+        String key = claudeSessionApiKey.isBlank() ? ClaudeApiSettings.defaults().apiKey() : claudeSessionApiKey;
+        return new ClaudeApiSettings(key, disk.model(), disk.baseUrl());
     }
 
     private void syncOllamaRuntimeSettings() {

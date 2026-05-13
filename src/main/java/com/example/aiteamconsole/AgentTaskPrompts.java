@@ -81,9 +81,9 @@ public final class AgentTaskPrompts {
     }
 
     /**
-     * Local Ollama coder: must emit a single git unified diff (or {@code NO_PATCH}).
+     * Local coding agent (Ollama, Claude API, etc.): emit a single git unified diff (or {@code NO_PATCH}).
      */
-    public static String buildOllamaCoderUserPrompt(
+    public static String buildCoderUserPrompt(
             AgentProfile agent,
             AgentTask task,
             String baseRef,
@@ -95,7 +95,7 @@ public final class AgentTaskPrompts {
         StringBuilder sb = new StringBuilder();
         sb.append(core).append("\n\n---\n");
         sb.append("""
-                LOCAL EXECUTION MODE (Ollama):
+                LOCAL EXECUTION MODE (local coding agent):
                 You cannot run shell commands yourself. The operator will apply your patch with `git apply` from the repository root.
                 Output EXACTLY ONE of:
                 (A) A single unified diff in git format, OR
@@ -134,6 +134,20 @@ public final class AgentTaskPrompts {
             sb.append("\n\nRepository layout (truncated):\n").append(repositoryLayoutSummary.strip());
         }
         return sb.toString();
+    }
+
+    /**
+     * Local Ollama coder: must emit a single git unified diff (or {@code NO_PATCH}).
+     */
+    public static String buildOllamaCoderUserPrompt(
+            AgentProfile agent,
+            AgentTask task,
+            String baseRef,
+            String requiredBranchName,
+            String repositoryLayoutSummary,
+            String qdrantContext
+    ) {
+        return buildCoderUserPrompt(agent, task, baseRef, requiredBranchName, repositoryLayoutSummary, qdrantContext);
     }
 
     private static String firstNonBlank(String a, String b, String c) {

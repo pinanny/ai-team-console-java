@@ -5,14 +5,23 @@ import java.nio.file.Path;
 public final class ProviderRegistry {
     private final CursorCloudAgentProvider cursorCloudAgentProvider;
     private final OllamaAgentProvider ollamaAgentProvider;
+    private final ClaudeApiAgentProvider claudeApiAgentProvider;
 
     public ProviderRegistry() {
-        this(new CursorCloudAgentProvider(), defaultOllamaProvider());
+        this(
+                new CursorCloudAgentProvider(),
+                defaultOllamaProvider(),
+                ClaudeApiAgentProvider.withDefaultWorkspace(GitHubJsonStore.defaultStore()));
     }
 
-    ProviderRegistry(CursorCloudAgentProvider cursorCloudAgentProvider, OllamaAgentProvider ollamaAgentProvider) {
+    ProviderRegistry(
+            CursorCloudAgentProvider cursorCloudAgentProvider,
+            OllamaAgentProvider ollamaAgentProvider,
+            ClaudeApiAgentProvider claudeApiAgentProvider
+    ) {
         this.cursorCloudAgentProvider = cursorCloudAgentProvider;
         this.ollamaAgentProvider = ollamaAgentProvider;
+        this.claudeApiAgentProvider = claudeApiAgentProvider;
     }
 
     private static OllamaAgentProvider defaultOllamaProvider() {
@@ -24,6 +33,7 @@ public final class ProviderRegistry {
         return switch (providerType) {
             case CURSOR_CLOUD -> cursorCloudAgentProvider;
             case OLLAMA -> ollamaAgentProvider;
+            case CLAUDE_API -> claudeApiAgentProvider;
         };
     }
 
@@ -33,5 +43,9 @@ public final class ProviderRegistry {
 
     public OllamaAgentProvider ollamaProvider() {
         return ollamaAgentProvider;
+    }
+
+    public ClaudeApiAgentProvider claudeApiProvider() {
+        return claudeApiAgentProvider;
     }
 }
