@@ -10,23 +10,24 @@ public final class GitHubRepoUrls {
     private GitHubRepoUrls() {
     }
 
+    private static String stripTrailingDotGit(String path) {
+        if (path.endsWith(".git")) {
+            return path.substring(0, path.length() - ".git".length());
+        }
+        return path;
+    }
+
     public static String normalizeHttpsRepositoryUrl(String url) {
         if (url == null || url.isBlank()) {
             return "";
         }
         String trimmed = url.strip();
         if (trimmed.startsWith("git@github.com:")) {
-            String path = trimmed.substring("git@github.com:".length());
-            if (path.endsWith(".git")) {
-                path = path.substring(0, path.length() - ".git".length());
-            }
+            String path = stripTrailingDotGit(trimmed.substring("git@github.com:".length()));
             return "https://github.com/" + path;
         }
         if (trimmed.startsWith("ssh://git@github.com/")) {
-            String path = trimmed.substring("ssh://git@github.com/".length());
-            if (path.endsWith(".git")) {
-                path = path.substring(0, path.length() - ".git".length());
-            }
+            String path = stripTrailingDotGit(trimmed.substring("ssh://git@github.com/".length()));
             return "https://github.com/" + path;
         }
         trimmed = trimmed.replaceFirst("(?i)^http://", "https://");
@@ -117,9 +118,7 @@ public final class GitHubRepoUrls {
         if (owner.isBlank() || repo.isBlank() || number <= 0) {
             return Optional.empty();
         }
-        if (repo.endsWith(".git")) {
-            repo = repo.substring(0, repo.length() - ".git".length());
-        }
+        repo = stripTrailingDotGit(repo);
         return Optional.of(new PullRequestRef(owner, repo, number));
     }
 }
