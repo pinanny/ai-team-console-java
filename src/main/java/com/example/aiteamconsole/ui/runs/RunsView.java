@@ -8,6 +8,7 @@ import com.example.aiteamconsole.TaskStatus;
 import com.example.aiteamconsole.ui.FxTableHelpers;
 import com.example.aiteamconsole.ui.MainViewModel;
 
+import javafx.beans.binding.Bindings;
 import javafx.beans.property.ReadOnlyObjectWrapper;
 import javafx.beans.property.SimpleStringProperty;
 import javafx.collections.ListChangeListener;
@@ -222,16 +223,28 @@ public final class RunsView {
     private TableColumn<AgentRun, String> pullRequestLinkColumn() {
         TableColumn<AgentRun, String> col = new TableColumn<>("PR");
         col.setCellValueFactory(cd -> {
-            String url = cd.getValue().pullRequestUrl();
-            return new SimpleStringProperty(url == null ? "" : url);
+            AgentRun run = cd.getValue();
+            var revision = vm.main().pullMergeLabelRevisionProperty();
+            return Bindings.createStringBinding(
+                    () -> {
+                        revision.get();
+                        String url = run.pullRequestUrl();
+                        return url == null ? "" : url;
+                    },
+                    revision
+            );
         });
         col.setPrefWidth(130);
         col.setMinWidth(100);
         col.setUserData("fixed-width");
         col.setCellFactory(ignored -> new TableCell<>() {
             private final Hyperlink link = new Hyperlink("Open PR");
+            private final Label mergedBadge = new Label("MERGED");
+            private final HBox mergedRow = new HBox(6, mergedBadge, link);
 
             {
+                mergedBadge.setStyle("-fx-text-fill: #1a7f37; -fx-font-weight: bold;");
+                mergedRow.setAlignment(Pos.CENTER_LEFT);
                 link.setOnAction(e -> vm.main().openUrl(getItem()));
             }
 
@@ -249,7 +262,14 @@ public final class RunsView {
                     return;
                 }
                 link.setTooltip(new Tooltip(item));
-                setGraphic(link);
+                boolean showMerged = vm.main().showMergedIntoMainPrefixForPullRequestUrl(item);
+                if (showMerged) {
+                    mergedBadge.setTooltip(new Tooltip("Merged into main"));
+                    setGraphic(mergedRow);
+                } else {
+                    mergedBadge.setTooltip(null);
+                    setGraphic(link);
+                }
             }
         });
         col.setComparator(Comparator.comparing((String u) -> u == null || u.isBlank()).thenComparing(String.CASE_INSENSITIVE_ORDER));

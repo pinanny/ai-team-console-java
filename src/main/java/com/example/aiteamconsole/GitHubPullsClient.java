@@ -13,6 +13,7 @@ import java.util.LinkedHashMap;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
+import java.util.Optional;
 
 /**
  * GitHub pull requests via REST API (create PRs and query merge state; user OAuth or GitHub App user token).
@@ -20,19 +21,41 @@ import java.util.Map;
 public final class GitHubPullsClient {
     private final HttpClient httpClient;
     private final ObjectMapper mapper;
+    private final URI githubApiBase;
 
     public GitHubPullsClient() {
-        this(HttpClient.newHttpClient(), new ObjectMapper());
+        this(HttpClient.newHttpClient(), new ObjectMapper(), URI.create("https://api.github.com"));
+    }
+
+    GitHubPullsClient(HttpClient httpClient, ObjectMapper mapper, URI githubApiBase) {
+        this.httpClient = httpClient;
+        this.mapper = mapper;
+        String s = githubApiBase.toString();
+        this.githubApiBase = s.endsWith("/") ? URI.create(s.substring(0, s.length() - 1)) : githubApiBase;
     }
 
     GitHubPullsClient(HttpClient httpClient, ObjectMapper mapper) {
-        this.httpClient = httpClient;
-        this.mapper = mapper;
+        this(httpClient, mapper, URI.create("https://api.github.com"));
+    }
+
+    /** @param merged GitHub {@code merged} field; {@code baseRef} short name from {@code base.ref} */
+    public record PullRequestMergeState(boolean merged, String baseRef) {
+    }
+
+    private URI repoMetadataUri(String owner, String repo) {
+        return githubApiBase.resolve("repos/" + owner + "/" + repo);
+    }
+
+    private URI pullsCollectionUri(String owner, String repo) {
+        return githubApiBase.resolve("repos/" + owner + "/" + repo + "/pulls");
+    }
+
+    private URI pullUri(String owner, String repo, int pullNumber) {
+        return githubApiBase.resolve("repos/" + owner + "/" + repo + "/pulls/" + pullNumber);
     }
 
     public String fetchDefaultBranch(String accessToken, String owner, String repo) throws IOException, InterruptedException {
-        HttpRequest request = HttpRequest.newBuilder(
-                        URI.create("https://api.github.com/repos/%s/%s".formatted(owner, repo)))
+        HttpRequest request = HttpRequest.newBuilder(repoMetadataUri(owner, repo))
                 .header("Accept", "application/vnd.github+json")
                 .header("Authorization", "Bearer " + accessToken)
                 .header("X-GitHub-Api-Version", "2022-11-28")
@@ -73,8 +96,7 @@ public final class GitHubPullsClient {
             jsonBody.put("body", body);
         }
         String payload = mapper.writeValueAsString(jsonBody);
-        HttpRequest request = HttpRequest.newBuilder(
-                        URI.create("https://api.github.com/repos/%s/%s/pulls".formatted(owner, repo)))
+        HttpRequest request = HttpRequest.newBuilder(pullsCollectionUri(owner, repo))
                 .header("Accept", "application/vnd.github+json")
                 .header("Authorization", "Bearer " + accessToken)
                 .header("X-GitHub-Api-Version", "2022-11-28")
@@ -222,12 +244,17 @@ public final class GitHubPullsClient {
     }
 
     /**
-     * {@code true} if GitHub reports the pull request as merged ({@code merged} field).
+     * Reads {@code merged} and {@code base.ref} from {@code GET /repos/{owner}/{repo}/pulls/{pullNumber}}.
+     *
+     * @return empty when GitHub responds {@code 404}
      */
-    public boolean isPullRequestMerged(String accessToken, String owner, String repo, int pullNumber)
-            throws IOException, InterruptedException {
-        HttpRequest request = HttpRequest.newBuilder(
-                        URI.create("https://api.github.com/repos/%s/%s/pulls/%d".formatted(owner, repo, pullNumber)))
+    public Optional<PullRequestMergeState> fetchPullRequestMergeState(
+            String accessToken,
+            String owner,
+            String repo,
+            int pullNumber
+    ) throws IOException, InterruptedException {
+        HttpRequest request = HttpRequest.newBuilder(pullUri(owner, repo, pullNumber))
                 .header("Accept", "application/vnd.github+json")
                 .header("Authorization", "Bearer " + accessToken)
                 .header("X-GitHub-Api-Version", "2022-11-28")
@@ -235,13 +262,25 @@ public final class GitHubPullsClient {
                 .build();
         HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
         if (response.statusCode() == 404) {
-            return false;
+            return Optional.empty();
         }
         if (response.statusCode() < 200 || response.statusCode() >= 300) {
             throw new IOException("GitHub GET /repos/%s/%s/pulls/%d HTTP %d: %s".formatted(
                     owner, repo, pullNumber, response.statusCode(), response.body()));
         }
         JsonNode root = mapper.readTree(response.body());
-        return root.path("merged").asBoolean(false);
+        boolean merged = root.path("merged").asBoolean(false);
+        String baseRef = root.path("base").path("ref").asText("");
+        return Optional.of(new PullRequestMergeState(merged, baseRef));
+    }
+
+    /**
+     * {@code true} if GitHub reports the pull request as merged ({@code merged} field).
+     */
+    public boolean isPullRequestMerged(String accessToken, String owner, String repo, int pullNumber)
+            throws IOException, InterruptedException {
+        return fetchPullRequestMergeState(accessToken, owner, repo, pullNumber)
+                .map(PullRequestMergeState::merged)
+                .orElse(false);
     }
 }

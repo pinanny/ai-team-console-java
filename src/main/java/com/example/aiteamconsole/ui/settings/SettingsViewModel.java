@@ -103,6 +103,7 @@ public final class SettingsViewModel {
                     githubSession.set(session);
                     LOG.info("GitHub sign-in completed for user @" + session.login());
                     progress.authorized(session);
+                    main.schedulePullMergeLabelRefreshIfIdle();
                 });
                 main.importGithubReposIntoTable(session.accessToken(), false);
             } catch (Exception ex) {
@@ -114,6 +115,7 @@ public final class SettingsViewModel {
     public void signOutGitHub() {
         githubStore.clearSession();
         githubSession.set(null);
+        main.onGithubSessionClearedForPullMergeLabels();
         LOG.info("GitHub session cleared for this OS user");
     }
 

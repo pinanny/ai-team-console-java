@@ -28,6 +28,8 @@ import com.example.aiteamconsole.ui.runs.RunsViewModel;
 import com.example.aiteamconsole.ui.settings.SettingsViewModel;
 import com.example.aiteamconsole.ui.tasks.TasksViewModel;
 
+import javafx.beans.property.ReadOnlyIntegerProperty;
+import javafx.beans.property.SimpleIntegerProperty;
 import javafx.collections.FXCollections;
 import javafx.collections.ObservableList;
 
@@ -35,6 +37,7 @@ import java.io.IOException;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Comparator;
+import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.Optional;
@@ -92,6 +95,16 @@ public final class MainViewModel {
     private static final int MAX_FINISHED_PR_FOLLOW_UP_POLLS = 3;
     private final ConcurrentHashMap<UUID, Integer> finishedRunFollowUpPollCount = new ConcurrentHashMap<>();
 
+    private enum PullMergeLabel {
+        UNKNOWN,
+        MERGED_INTO_MAIN,
+        NOT_MERGED_INTO_MAIN
+    }
+
+    private final ConcurrentHashMap<String, PullMergeLabel> pullMergeLabelByKey = new ConcurrentHashMap<>();
+    private final AtomicBoolean pullMergeLabelRefreshInFlight = new AtomicBoolean(false);
+    private final SimpleIntegerProperty pullMergeLabelRevision = new SimpleIntegerProperty(0);
+
     public MainViewModel(StateStore stateStore, ProviderRegistry providerRegistry, GitHubDeviceFlowService gitHubDeviceFlow) {
         this.stateStore = stateStore;
         this.providerRegistry = providerRegistry;
@@ -146,6 +159,7 @@ public final class MainViewModel {
 
         CompletableFuture.runAsync(this::checkWaitingReviewTasksForMergedPrs);
         lastPrMergeWatchNanos = System.nanoTime();
+        schedulePullMergeLabelRefreshIfIdle();
     }
 
     public void pollActiveRuns() {
@@ -156,6 +170,98 @@ public final class MainViewModel {
             lastPrMergeWatchNanos = now;
             CompletableFuture.runAsync(this::checkWaitingReviewTasksForMergedPrs);
         }
+        schedulePullMergeLabelRefreshIfIdle();
+    }
+
+    public ReadOnlyIntegerProperty pullMergeLabelRevisionProperty() {
+        return pullMergeLabelRevision;
+    }
+
+    /**
+     * {@code true} when the latest successful GitHub read says the PR is merged and its {@code base.ref} is {@code main}.
+     */
+    public boolean showMergedIntoMainPrefixForPullRequestUrl(String htmlUrl) {
+        if (htmlUrl == null || htmlUrl.isBlank()) {
+            return false;
+        }
+        Optional<GitHubRepoUrls.PullRequestRef> ref = GitHubRepoUrls.parsePullRequestHtmlUrl(htmlUrl);
+        if (ref.isEmpty()) {
+            return false;
+        }
+        PullMergeLabel label = pullMergeLabelByKey.get(pullMergeCacheKey(ref.get()));
+        return label == PullMergeLabel.MERGED_INTO_MAIN;
+    }
+
+    public void onGithubSessionClearedForPullMergeLabels() {
+        pullMergeLabelByKey.clear();
+        fxRunner(() -> pullMergeLabelRevision.set(pullMergeLabelRevision.get() + 1));
+    }
+
+    public void schedulePullMergeLabelRefreshIfIdle() {
+        if (!pullMergeLabelRefreshInFlight.compareAndSet(false, true)) {
+            return;
+        }
+        CompletableFuture.runAsync(() -> {
+            try {
+                refreshPullMergeLabelsFromGitHub();
+            } finally {
+                pullMergeLabelRefreshInFlight.set(false);
+            }
+        });
+    }
+
+    private static String pullMergeCacheKey(GitHubRepoUrls.PullRequestRef ref) {
+        return ref.owner() + "/" + ref.repo() + "#" + ref.number();
+    }
+
+    private void refreshPullMergeLabelsFromGitHub() {
+        Optional<GitHubSession> sessionOpt = githubStore.loadSession();
+        if (sessionOpt.isEmpty()) {
+            pullMergeLabelByKey.clear();
+            bumpPullMergeLabelRevision();
+            return;
+        }
+        String token = sessionOpt.get().accessToken();
+        LinkedHashMap<String, GitHubRepoUrls.PullRequestRef> unique = new LinkedHashMap<>();
+        for (AgentRun run : agentRuns) {
+            Optional<GitHubRepoUrls.PullRequestRef> pr = GitHubRepoUrls.parsePullRequestHtmlUrl(run.pullRequestUrl());
+            if (pr.isPresent()) {
+                GitHubRepoUrls.PullRequestRef r = pr.get();
+                unique.putIfAbsent(pullMergeCacheKey(r), r);
+            }
+        }
+        pullMergeLabelByKey.keySet().retainAll(unique.keySet());
+        for (var entry : unique.entrySet()) {
+            String key = entry.getKey();
+            GitHubRepoUrls.PullRequestRef ref = entry.getValue();
+            try {
+                Optional<GitHubPullsClient.PullRequestMergeState> state =
+                        githubPullsClient.fetchPullRequestMergeState(token, ref.owner(), ref.repo(), ref.number());
+                PullMergeLabel label;
+                if (state.isEmpty()) {
+                    label = PullMergeLabel.NOT_MERGED_INTO_MAIN;
+                } else {
+                    GitHubPullsClient.PullRequestMergeState s = state.get();
+                    label = (s.merged() && "main".equals(s.baseRef()))
+                            ? PullMergeLabel.MERGED_INTO_MAIN
+                            : PullMergeLabel.NOT_MERGED_INTO_MAIN;
+                }
+                pullMergeLabelByKey.put(key, label);
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                pullMergeLabelByKey.put(key, PullMergeLabel.UNKNOWN);
+                bumpPullMergeLabelRevision();
+                return;
+            } catch (Exception e) {
+                LOG.log(Level.FINE, "PR merge label: GitHub error for " + key, e);
+                pullMergeLabelByKey.put(key, PullMergeLabel.UNKNOWN);
+            }
+        }
+        bumpPullMergeLabelRevision();
+    }
+
+    private void bumpPullMergeLabelRevision() {
+        fxRunner(() -> pullMergeLabelRevision.set(pullMergeLabelRevision.get() + 1));
     }
 
     public void save() {
