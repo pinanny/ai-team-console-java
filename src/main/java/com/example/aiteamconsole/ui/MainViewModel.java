@@ -30,6 +30,7 @@ import com.example.aiteamconsole.ui.tasks.TasksViewModel;
 
 import javafx.collections.FXCollections;
 import javafx.collections.ObservableList;
+import javafx.collections.ObservableMap;
 
 import java.io.IOException;
 import java.time.Instant;
@@ -67,6 +68,8 @@ public final class MainViewModel {
     private final GitHubJsonStore githubStore = GitHubJsonStore.defaultStore();
     private final GitHubPullsClient githubPullsClient = new GitHubPullsClient();
     private final GitHubReposClient githubReposClient = new GitHubReposClient();
+    /** Keys are run IDs; value is always {@code true} when GitHub confirms merged into {@code main}. */
+    private final ObservableMap<UUID, Boolean> pullRequestMergedIntoMainByRunId = FXCollections.observableHashMap();
     private final OllamaRuntimeSettings.Store ollamaSettingsStore = OllamaRuntimeSettings.Store.defaultStore();
     private final ScheduledExecutorService followUpScheduler = Executors.newSingleThreadScheduledExecutor(r -> {
         Thread t = new Thread(r, "finished-run-follow-up");
@@ -109,6 +112,13 @@ public final class MainViewModel {
         );
         this.tasks = new TasksViewModel(this, providerRegistry, () -> settings.toAppSettings());
         this.runs = new RunsViewModel(this, providerRegistry, () -> settings.toAppSettings());
+        settings.githubSession.addListener((obs, previous, session) -> {
+            if (session == null) {
+                fxRunner(pullRequestMergedIntoMainByRunId::clear);
+            } else {
+                CompletableFuture.runAsync(this::refreshAllPullRequestMergeLabels);
+            }
+        });
     }
 
     private UiEnvironment ui() {
@@ -145,6 +155,7 @@ public final class MainViewModel {
         settings.reloadGithubSessionFromStore();
 
         CompletableFuture.runAsync(this::checkWaitingReviewTasksForMergedPrs);
+        CompletableFuture.runAsync(this::refreshAllPullRequestMergeLabels);
         lastPrMergeWatchNanos = System.nanoTime();
     }
 
@@ -155,6 +166,7 @@ public final class MainViewModel {
         if (now - lastPrMergeWatchNanos >= PR_MERGE_WATCH_NANOS) {
             lastPrMergeWatchNanos = now;
             CompletableFuture.runAsync(this::checkWaitingReviewTasksForMergedPrs);
+            CompletableFuture.runAsync(this::refreshAllPullRequestMergeLabels);
         }
     }
 
@@ -292,6 +304,78 @@ public final class MainViewModel {
         });
     }
 
+    private void refreshAllPullRequestMergeLabels() {
+        Optional<GitHubSession> sessionOpt = githubStore.loadSession();
+        if (sessionOpt.isEmpty()) {
+            fxRunner(pullRequestMergedIntoMainByRunId::clear);
+            return;
+        }
+        List<AgentRun> snapshot = List.copyOf(agentRuns);
+        fxRunner(() -> {
+            for (AgentRun run : snapshot) {
+                String u = run.pullRequestUrl();
+                if (u == null || u.isBlank() || GitHubRepoUrls.parsePullRequestHtmlUrl(u).isEmpty()) {
+                    pullRequestMergedIntoMainByRunId.remove(run.id());
+                }
+            }
+        });
+        String token = sessionOpt.get().accessToken();
+        for (AgentRun run : snapshot) {
+            String prUrl = run.pullRequestUrl();
+            if (prUrl == null || prUrl.isBlank()) {
+                continue;
+            }
+            applyPullMergeLabelFromGithub(run.id(), prUrl, token);
+        }
+    }
+
+    private void refreshPullRequestMergeLabelForRun(AgentRun run) {
+        if (run == null) {
+            return;
+        }
+        CompletableFuture.runAsync(() -> {
+            Optional<GitHubSession> sessionOpt = githubStore.loadSession();
+            if (sessionOpt.isEmpty()) {
+                fxRunner(() -> pullRequestMergedIntoMainByRunId.remove(run.id()));
+                return;
+            }
+            String prUrl = run.pullRequestUrl();
+            if (prUrl == null || prUrl.isBlank()) {
+                fxRunner(() -> pullRequestMergedIntoMainByRunId.remove(run.id()));
+                return;
+            }
+            applyPullMergeLabelFromGithub(run.id(), prUrl, sessionOpt.get().accessToken());
+        });
+    }
+
+    /**
+     * One authoritative GitHub read; updates FX map on success; removes label on error or non-match (no false positives).
+     */
+    private void applyPullMergeLabelFromGithub(UUID runId, String prUrl, String accessToken) {
+        Optional<GitHubRepoUrls.PullRequestRef> refOpt = GitHubRepoUrls.parsePullRequestHtmlUrl(prUrl);
+        if (refOpt.isEmpty()) {
+            fxRunner(() -> pullRequestMergedIntoMainByRunId.remove(runId));
+            return;
+        }
+        GitHubRepoUrls.PullRequestRef pr = refOpt.get();
+        try {
+            GitHubPullsClient.PullRequestSnapshot snap = githubPullsClient.fetchPullRequestSnapshot(
+                    accessToken, pr.owner(), pr.repo(), pr.number());
+            fxRunner(() -> {
+                if (snap.merged() && "main".equals(snap.baseRef())) {
+                    pullRequestMergedIntoMainByRunId.put(runId, true);
+                } else {
+                    pullRequestMergedIntoMainByRunId.remove(runId);
+                }
+            });
+        } catch (InterruptedException e) {
+            Thread.currentThread().interrupt();
+        } catch (IOException e) {
+            LOG.log(Level.FINE, "PR merge label: GitHub error for run " + runId, e);
+            fxRunner(() -> pullRequestMergedIntoMainByRunId.remove(runId));
+        }
+    }
+
     private Optional<AgentRun> latestFinishedRunWithPullRequest(UUID taskId) {
         return agentRuns.stream()
                 .filter(r -> r.taskId().equals(taskId))
@@ -375,6 +459,7 @@ public final class MainViewModel {
         notifyRunsLogRefresh(run.id(), latest);
         save();
         scheduleFinishedRunFollowUpPollIfNeeded(latest);
+        refreshPullRequestMergeLabelForRun(latest);
     }
 
     private void scheduleFinishedRunFollowUpPollIfNeeded(AgentRun run) {
@@ -551,6 +636,7 @@ public final class MainViewModel {
             } else {
                 agentRuns.add(run);
                 replaceTask(queuedTask.withStatus(TaskStatus.RUNNING));
+                refreshPullRequestMergeLabelForRun(run);
             }
             save();
         }));
@@ -865,6 +951,7 @@ public final class MainViewModel {
             updateTaskFromRun(updated);
             save();
             notifyRunsLogRefresh(runId, updated);
+            refreshPullRequestMergeLabelForRun(updated);
         }));
     }
 
@@ -1135,6 +1222,13 @@ public final class MainViewModel {
 
     public GitHubJsonStore githubStore() {
         return githubStore;
+    }
+
+    /**
+     * Run IDs for which GitHub has confirmed the PR is merged with base branch {@code main}. Absent keys mean unknown or not merged into {@code main}.
+     */
+    public ObservableMap<UUID, Boolean> pullRequestMergedIntoMainLabels() {
+        return pullRequestMergedIntoMainByRunId;
     }
 
     public OllamaRuntimeSettings.Store ollamaSettingsStore() {

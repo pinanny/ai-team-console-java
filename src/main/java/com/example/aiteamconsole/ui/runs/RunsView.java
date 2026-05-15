@@ -28,8 +28,11 @@ import javafx.scene.layout.Priority;
 import javafx.scene.layout.Region;
 import javafx.scene.layout.VBox;
 
+import javafx.collections.MapChangeListener;
+
 import java.time.Instant;
 import java.util.Comparator;
+import java.util.UUID;
 
 public final class RunsView {
 
@@ -43,6 +46,8 @@ public final class RunsView {
         MainViewModel main = vm.main();
         TableView<AgentRun> table = new TableView<>(vm.sorted);
         vm.sorted.comparatorProperty().bind(table.comparatorProperty());
+        vm.main().pullRequestMergedIntoMainLabels().addListener((MapChangeListener<? super UUID, ? super Boolean>) c ->
+                javafx.application.Platform.runLater(table::refresh));
 
         TableColumn<AgentRun, Instant> startedAtCol = runStartedAtColumn();
         table.getColumns().add(startedAtCol);
@@ -229,9 +234,13 @@ public final class RunsView {
         col.setMinWidth(100);
         col.setUserData("fixed-width");
         col.setCellFactory(ignored -> new TableCell<>() {
+            private final Label mergedBadge = new Label("MERGED");
             private final Hyperlink link = new Hyperlink("Open PR");
+            private final HBox prCell = new HBox(8, mergedBadge, link);
 
             {
+                mergedBadge.setStyle("-fx-font-weight: bold; -fx-text-fill: #2e7d32;");
+                prCell.setAlignment(Pos.CENTER_LEFT);
                 link.setOnAction(e -> vm.main().openUrl(getItem()));
             }
 
@@ -242,14 +251,19 @@ public final class RunsView {
                     setGraphic(null);
                     return;
                 }
+                AgentRun rowRun = getTableRow() != null ? getTableRow().getItem() : null;
                 if (item == null || item.isBlank()) {
                     Label dash = new Label("—");
                     dash.setStyle("-fx-text-fill: #888;");
                     setGraphic(dash);
                     return;
                 }
-                link.setTooltip(new Tooltip(item));
-                setGraphic(link);
+                boolean mergedIntoMain = rowRun != null
+                        && Boolean.TRUE.equals(vm.main().pullRequestMergedIntoMainLabels().get(rowRun.id()));
+                mergedBadge.setManaged(mergedIntoMain);
+                mergedBadge.setVisible(mergedIntoMain);
+                link.setTooltip(new Tooltip(mergedIntoMain ? item + "\n\nMerged into branch main." : item));
+                setGraphic(prCell);
             }
         });
         col.setComparator(Comparator.comparing((String u) -> u == null || u.isBlank()).thenComparing(String.CASE_INSENSITIVE_ORDER));
