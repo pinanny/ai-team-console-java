@@ -31,6 +31,8 @@ public final class SettingsViewModel {
 
     public final StringProperty cursorApiKey = new SimpleStringProperty("");
     public final StringProperty cursorBaseUrl = new SimpleStringProperty("https://api.cursor.com");
+    /** Optional Cursor Cloud model ID. Empty = omit field, let Cursor use its default. */
+    public final StringProperty cursorCloudModelId = new SimpleStringProperty("");
     public final StringProperty ollamaBaseUrl = new SimpleStringProperty("http://localhost:11434");
     public final StringProperty ollamaModel = new SimpleStringProperty("llama3.2:3b");
     public final ObjectProperty<GitHubSession> githubSession = new SimpleObjectProperty<>();
@@ -57,6 +59,7 @@ public final class SettingsViewModel {
         CursorApiCredentials storedCursorApi = cursorApiStore.load();
         cursorApiKey.set(!storedCursorApi.apiKey().isBlank() ? storedCursorApi.apiKey() : defaults.cursorApiKey());
         cursorBaseUrl.set(defaults.cursorBaseUrl());
+        cursorCloudModelId.set(defaults.cursorCloudModelId());
     }
 
     public void reloadGithubSessionFromStore() {
@@ -68,7 +71,8 @@ public final class SettingsViewModel {
         String base = cursorBaseUrl.get() == null || cursorBaseUrl.get().isBlank()
                 ? AppSettings.fromEnvironment().cursorBaseUrl()
                 : cursorBaseUrl.get().strip();
-        return new AppSettings(key, base).normalized();
+        String modelId = cursorCloudModelId.get() == null ? "" : cursorCloudModelId.get().strip();
+        return new AppSettings(key, base, modelId).normalized();
     }
 
     public void saveCursorApiKeyToDisk() {

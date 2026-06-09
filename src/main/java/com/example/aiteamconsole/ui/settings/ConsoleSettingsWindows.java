@@ -27,12 +27,16 @@ import javafx.scene.control.TextField;
 import javafx.scene.input.Clipboard;
 import javafx.scene.input.DataFormat;
 import javafx.scene.layout.GridPane;
+import javafx.collections.FXCollections;
+import javafx.scene.control.ComboBox;
+import javafx.scene.control.Tooltip;
 import javafx.scene.layout.HBox;
 import javafx.scene.layout.Priority;
 import javafx.scene.layout.VBox;
 import javafx.stage.Stage;
 
 import java.net.URI;
+import java.util.ArrayList;
 import java.util.List;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.TimeUnit;
@@ -64,11 +68,13 @@ public final class ConsoleSettingsWindows {
             }
             settings.saveCursorApiKeyToDisk();
             main.dialogs().showInfo("Saved Cursor API key to %s. Use \"Forget\" to delete it.".formatted(settings.cursorApiKeyFilePath()));
+            main.runConnectivityChecksAsync(false);
         });
         Button forgetCursorApiKey = new Button("Forget");
         forgetCursorApiKey.setOnAction(event -> {
             settings.forgetCursorApiKeyOnDisk();
             main.dialogs().showInfo("Removed local Cursor API key file (env CURSOR_API_KEY still applies if set).");
+            main.runConnectivityChecksAsync(false);
         });
 
         HBox apiKeyRow = new HBox(8, new Label("Cursor API key"), cursorApiKeyField, saveCursorApiKey, forgetCursorApiKey);
@@ -135,11 +141,18 @@ public final class ConsoleSettingsWindows {
         HBox verifyRow = new HBox(8, new Label("GitHub check"), verifyRepoUrl, verifyRepo);
         HBox.setHgrow(verifyRepoUrl, Priority.ALWAYS);
 
-        Label modelNote = new Label(
-                "Cloud Agents always use model Composer 2 (API id: " + CursorCloudAgentProvider.CURSOR_CLOUD_MODEL_ID + "). "
-                        + "Optional override of API base URL: set env CURSOR_API_BASE_URL (default https://api.cursor.com).");
-        modelNote.setWrapText(true);
-        modelNote.setStyle("-fx-text-fill: #666;");
+        // Model ID field — optional, leave blank to let Cursor use its default
+        TextField modelIdField = new TextField();
+        modelIdField.setPromptText("blank = Cursor default  (e.g. claude-sonnet-4-5, gpt-4o)");
+        modelIdField.textProperty().bindBidirectional(main.settings.cursorCloudModelId);
+        Label modelIdHint = new Label(
+                "Model ID is optional. Leave blank and Cursor uses its account default. "
+                        + "Set only if the API returns \"invalid_model\" — enter the exact ID Cursor requires "
+                        + "(e.g. claude-sonnet-4-5). Can also be set via env CURSOR_CLOUD_MODEL_ID.");
+        modelIdHint.setWrapText(true);
+        modelIdHint.setStyle("-fx-text-fill: #666;");
+        HBox modelIdRow = new HBox(8, new Label("Model ID"), modelIdField);
+        HBox.setHgrow(modelIdField, Priority.ALWAYS);
 
         Label stateNote = new Label(
                 "State file: %s. API keys are not stored there.".formatted(main.stateStore().stateFile()));
@@ -157,7 +170,10 @@ public final class ConsoleSettingsWindows {
                 new Separator(),
                 new Label("Repository visibility (Cursor lists accessible repos)"),
                 verifyRow,
-                modelNote,
+                new Separator(),
+                new Label("Model (optional)"),
+                modelIdRow,
+                modelIdHint,
                 new Separator(),
                 new Label("Local data"),
                 stateNote,
@@ -177,8 +193,130 @@ public final class ConsoleSettingsWindows {
         OllamaRuntimeSettings.Store store = main.ollamaSettingsStore();
         OllamaRuntimeSettings cur = store.load();
         TextField baseUrl = new TextField(cur.ollamaBaseUrl());
-        TextField model = new TextField(cur.ollamaModel());
         TextField embedModel = new TextField(cur.embeddingModel());
+
+        // Popular models for first-time users who haven't pulled anything yet
+        List<String> popularModels = List.of(
+                "llama3.2:3b", "llama3.2:1b", "llama3.1:8b",
+                "qwen2.5-coder:7b", "qwen2.5-coder:3b",
+                "mistral:7b", "gemma2:9b", "gemma2:2b",
+                "deepseek-coder-v2:16b", "phi4:14b", "phi3.5:3.8b"
+        );
+        ComboBox<String> model = new ComboBox<>(FXCollections.observableArrayList(popularModels));
+        model.setEditable(true);
+        model.setValue(cur.ollamaModel());
+        model.setPrefWidth(220);
+        model.setTooltip(new Tooltip("Select from installed models or type a model name.\n"
+                + "Must match `ollama list` exactly (e.g. llama3.2:3b)."));
+
+        Button refreshModels = new Button("↺ Refresh list");
+        refreshModels.setTooltip(new Tooltip("Load installed models from your Ollama instance"));
+        refreshModels.setOnAction(e -> {
+            refreshModels.setDisable(true);
+            refreshModels.setText("Loading…");
+            String url = baseUrl.getText().strip().isEmpty() ? "http://127.0.0.1:11434" : baseUrl.getText().strip();
+            CompletableFuture.supplyAsync(() -> {
+                try {
+                    return main.providerRegistry().ollamaProvider().ollamaHttp().listLocalModels(url);
+                } catch (Exception ex) {
+                    throw new RuntimeException(ex.getMessage(), ex);
+                }
+            }).whenComplete((names, err) -> Platform.runLater(() -> {
+                refreshModels.setDisable(false);
+                refreshModels.setText("↺ Refresh list");
+                if (err != null) {
+                    main.dialogs().showError("Could not reach Ollama at " + url + ":\n" + err.getMessage());
+                    return;
+                }
+                String current = model.getValue();
+                List<String> combined = new ArrayList<>(names);
+                for (String pop : popularModels) {
+                    if (!combined.contains(pop)) combined.add(pop);
+                }
+                model.setItems(FXCollections.observableArrayList(combined));
+                model.setValue(current);
+            }));
+        });
+
+        Button pullModel = new Button("⬇ Pull model");
+        pullModel.setTooltip(new Tooltip("Download the selected model from Ollama registry.\n"
+                + "Runs `ollama pull <model>` in the background."));
+        pullModel.setOnAction(e -> {
+            String modelName = model.getValue();
+            if (modelName == null || modelName.isBlank()) {
+                main.dialogs().showError("Enter a model name first.");
+                return;
+            }
+            String ollamaUrl = baseUrl.getText().strip().isEmpty() ? "http://127.0.0.1:11434" : baseUrl.getText().strip();
+            // Show progress dialog
+            Stage pullDlg = new Stage();
+            pullDlg.initOwner(dlg);
+            pullDlg.setTitle("Pulling " + modelName);
+            Label statusLabel = new Label("Starting pull…");
+            statusLabel.setWrapText(true);
+            ProgressIndicator progress = new ProgressIndicator();
+            progress.setPrefSize(32, 32);
+            Button cancelBtn = new Button("Close");
+            cancelBtn.setOnAction(ev -> pullDlg.close());
+            VBox pullRoot = new VBox(10, progress, statusLabel, cancelBtn);
+            pullRoot.setPadding(new Insets(16));
+            pullRoot.setStyle("-fx-min-width: 340;");
+            pullDlg.setScene(new Scene(pullRoot));
+            pullDlg.show();
+
+            CompletableFuture.runAsync(() -> {
+                try {
+                    main.providerRegistry().ollamaProvider().ollamaHttp().pullModel(
+                            ollamaUrl, modelName,
+                            line -> {
+                                // Parse status from JSON line like {"status":"pulling manifest"}
+                                String display = line;
+                                try {
+                                    com.fasterxml.jackson.databind.JsonNode node =
+                                            new com.fasterxml.jackson.databind.ObjectMapper().readTree(line);
+                                    String status = node.path("status").asText("");
+                                    long completed = node.path("completed").asLong(0);
+                                    long total = node.path("total").asLong(0);
+                                    if (total > 0) {
+                                        display = status + " " + (completed * 100 / total) + "%";
+                                    } else if (!status.isBlank()) {
+                                        display = status;
+                                    }
+                                } catch (Exception ignored) { }
+                                final String msg = display;
+                                Platform.runLater(() -> statusLabel.setText(msg));
+                            });
+                    Platform.runLater(() -> {
+                        progress.setProgress(1.0);
+                        statusLabel.setText("✓ Pull complete: " + modelName);
+                        cancelBtn.setText("Done");
+                        // Refresh model list after successful pull
+                        String refreshUrl = ollamaUrl;
+                        CompletableFuture.supplyAsync(() -> {
+                            try {
+                                return main.providerRegistry().ollamaProvider().ollamaHttp().listLocalModels(refreshUrl);
+                            } catch (Exception ex) { return List.<String>of(); }
+                        }).whenComplete((names, err2) -> Platform.runLater(() -> {
+                            if (names != null && !names.isEmpty()) {
+                                String cur2 = model.getValue();
+                                List<String> combined = new ArrayList<>(names);
+                                for (String pop : popularModels) if (!combined.contains(pop)) combined.add(pop);
+                                model.setItems(FXCollections.observableArrayList(combined));
+                                model.setValue(cur2);
+                            }
+                        }));
+                    });
+                } catch (Exception ex) {
+                    Platform.runLater(() -> {
+                        progress.setProgress(0);
+                        statusLabel.setText("✗ Pull failed: " + ex.getMessage());
+                        cancelBtn.setText("Close");
+                    });
+                }
+            });
+        });
+        HBox modelRow = new HBox(6, model, refreshModels, pullModel);
+        HBox.setHgrow(model, Priority.ALWAYS);
         CheckBox qEn = new CheckBox("Enable Qdrant RAG for Ollama runs");
         qEn.setSelected(cur.qdrantEnabled());
         TextField qUrl = new TextField(cur.qdrantBaseUrl());
@@ -192,7 +330,7 @@ public final class ConsoleSettingsWindows {
             try {
                 OllamaRuntimeSettings next = new OllamaRuntimeSettings(
                         baseUrl.getText(),
-                        model.getText(),
+                        model.getValue() == null ? "" : model.getValue(),
                         embedModel.getText(),
                         qEn.isSelected(),
                         qUrl.getText(),
@@ -224,7 +362,7 @@ public final class ConsoleSettingsWindows {
         grid.setVgap(8);
         int r = 0;
         grid.addRow(r++, new Label("Ollama base URL"), baseUrl);
-        grid.addRow(r++, new Label("Chat model"), model);
+        grid.addRow(r++, new Label("Chat model"), modelRow);
         grid.addRow(r++, new Label("Embedding model"), embedModel);
         grid.addRow(r++, qEn, new Label(""));
         grid.addRow(r++, new Label("Qdrant base URL"), qUrl);
@@ -233,7 +371,7 @@ public final class ConsoleSettingsWindows {
         grid.addRow(r++, new Label("RAG max files"), maxFiles);
         grid.addRow(r++, new Label("RAG chunk chars"), chunk);
         GridPane.setColumnSpan(baseUrl, 3);
-        GridPane.setColumnSpan(model, 3);
+        GridPane.setColumnSpan(modelRow, 3);
         GridPane.setColumnSpan(embedModel, 3);
         GridPane.setColumnSpan(qUrl, 3);
         GridPane.setColumnSpan(qCol, 3);
@@ -298,6 +436,7 @@ public final class ConsoleSettingsWindows {
         ghSignOut.setOnAction(event -> {
             settings.signOutGitHub();
             refreshStatus.run();
+            main.runConnectivityChecksAsync(false);
         });
 
         Button reimport = new Button("Import my repositories now");
@@ -384,6 +523,7 @@ public final class ConsoleSettingsWindows {
             public void authorized(com.example.aiteamconsole.GitHubSession session) {
                 dlg.close();
                 main.dialogs().showInfo("Signed in to GitHub as @" + session.login() + ". Importing your repositories…");
+                main.runConnectivityChecksAsync(false);
             }
 
             @Override

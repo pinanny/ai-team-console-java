@@ -68,7 +68,7 @@ class CursorCloudAgentProviderTest {
         AgentRun run = provider.startTask(
                 agent,
                 task,
-                new AppSettings("cursor_test_key", "http://localhost:" + server.getAddress().getPort())
+                new AppSettings("cursor_test_key", "http://localhost:" + server.getAddress().getPort(), "")
         );
 
         assertEquals("bc-test-agent", run.externalAgentId());
@@ -87,6 +87,110 @@ class CursorCloudAgentProviderTest {
         assertTrue(body.get().contains("BE-TASK01 Add cache tests"));
         assertTrue(body.get().contains("Pull request description (mandatory"));
         assertTrue(body.get().contains("composer-2"));
+    }
+
+    @Test
+    void productAnalystRunRequestsAutoCreatePrFalse() throws Exception {
+        AtomicReference<String> body = new AtomicReference<>();
+
+        server = HttpServer.create(new InetSocketAddress(0), 0);
+        server.createContext("/v1/agents", exchange -> {
+            body.set(new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8));
+            byte[] response = """
+                    {"agent":{"id":"pa-agent"},"run":{"id":"pa-run"}}
+                    """.getBytes(StandardCharsets.UTF_8);
+            exchange.getResponseHeaders().add("Content-Type", "application/json");
+            exchange.sendResponseHeaders(200, response.length);
+            exchange.getResponseBody().write(response);
+            exchange.close();
+        });
+        server.start();
+
+        CursorCloudAgentProvider provider = new CursorCloudAgentProvider();
+        AgentProfile pa = new AgentProfile(
+                UUID.randomUUID(),
+                "PA",
+                AgentRole.PRODUCT_ANALYST,
+                ProviderType.CURSOR_CLOUD,
+                "https://github.com/example/repo",
+                "main",
+                "cursor",
+                true,
+                java.time.Instant.now(),
+                java.util.List.of()
+        );
+        AgentTask task = AgentTask.create(
+                "PA-TASK",
+                1,
+                "Idea",
+                "Rough idea.",
+                "",
+                "main",
+                pa.id()
+        );
+
+        provider.startTask(
+                pa,
+                task,
+                new AppSettings("cursor_test_key", "http://localhost:" + server.getAddress().getPort(), "")
+        );
+
+        assertTrue(body.get().contains("\"autoCreatePR\":false"), body.get());
+    }
+
+    @Test
+    void postPullRequestReviewHintsDisableAutoPrAndSkipReviewerRequest() throws Exception {
+        AtomicReference<String> body = new AtomicReference<>();
+
+        server = HttpServer.create(new InetSocketAddress(0), 0);
+        server.createContext("/v1/agents", exchange -> {
+            body.set(new String(exchange.getRequestBody().readAllBytes(), StandardCharsets.UTF_8));
+            byte[] response = """
+                    {"agent":{"id":"rev-agent"},"run":{"id":"rev-run"}}
+                    """.getBytes(StandardCharsets.UTF_8);
+            exchange.getResponseHeaders().add("Content-Type", "application/json");
+            exchange.sendResponseHeaders(200, response.length);
+            exchange.getResponseBody().write(response);
+            exchange.close();
+        });
+        server.start();
+
+        CursorCloudAgentProvider provider = new CursorCloudAgentProvider();
+        AgentProfile reviewer = new AgentProfile(
+                UUID.randomUUID(),
+                "Reviewer",
+                AgentRole.CODE_REVIEWER,
+                ProviderType.CURSOR_CLOUD,
+                "https://github.com/example/repo",
+                "main",
+                "cursor",
+                true,
+                java.time.Instant.now(),
+                java.util.List.of()
+        );
+        AgentTask task = AgentTask.create(
+                "BE-TASK",
+                1,
+                "Add cache tests",
+                "Write focused tests for cache behavior.",
+                "",
+                "main",
+                reviewer.id()
+        );
+        String pr = "https://github.com/example/repo/pull/42";
+        TaskLaunchHints hints = TaskLaunchHints.postPullRequestCodeReview(pr, "cursor/be-task01-add-cache-tests");
+        provider.startTask(
+                reviewer,
+                task,
+                new AppSettings("cursor_test_key", "http://localhost:" + server.getAddress().getPort(), ""),
+                hints
+        );
+
+        String b = body.get();
+        assertTrue(b.contains("\"autoCreatePR\":false"), b);
+        assertTrue(b.contains("\"skipReviewerRequest\":true"), b);
+        assertTrue(b.contains(pr), b);
+        assertTrue(b.contains("Post-PR code review"), b);
     }
 
     @Test
@@ -120,7 +224,7 @@ class CursorCloudAgentProviderTest {
 
         AgentRun refreshed = provider.refreshRun(
                 run,
-                new AppSettings("cursor_test_key", "http://localhost:" + server.getAddress().getPort())
+                new AppSettings("cursor_test_key", "http://localhost:" + server.getAddress().getPort(), "")
         );
 
         String lastLog = refreshed.logs().getLast().message();
@@ -161,7 +265,7 @@ class CursorCloudAgentProviderTest {
 
         AgentRun refreshed = provider.refreshRun(
                 run,
-                new AppSettings("cursor_test_key", "http://localhost:" + server.getAddress().getPort())
+                new AppSettings("cursor_test_key", "http://localhost:" + server.getAddress().getPort(), "")
         );
 
         assertEquals(RunStatus.FINISHED, refreshed.status());
@@ -196,7 +300,8 @@ class CursorCloudAgentProviderTest {
         );
         AppSettings settings = new AppSettings(
                 "cursor_test_key",
-                "http://localhost:" + server.getAddress().getPort()
+                "http://localhost:" + server.getAddress().getPort(),
+                ""
         );
 
         AgentRun first = provider.refreshRun(run, settings);
@@ -208,6 +313,42 @@ class CursorCloudAgentProviderTest {
         assertEquals(1L, verifyLogs, "Verification log must be appended exactly once across polls");
         assertTrue(second.logs().stream()
                 .anyMatch(e -> e.message().contains("ROLE-VERIFY: Backend Engineer | TASK: BE-TASK01")));
+    }
+
+    @Test
+    void refreshRunExtractsPullRequestUrlEmbeddedInSummary() throws Exception {
+        server = HttpServer.create(new InetSocketAddress(0), 0);
+        server.createContext("/v1/agents/bc-test-agent/runs/run-test", exchange -> {
+            byte[] response = """
+                    {
+                      "status": "FINISHED",
+                      "summary": "Done. Review: https://github.com/acme/sample-repo/pull/42 thanks."
+                    }
+                    """.getBytes(StandardCharsets.UTF_8);
+            exchange.getResponseHeaders().add("Content-Type", "application/json");
+            exchange.sendResponseHeaders(200, response.length);
+            exchange.getResponseBody().write(response);
+            exchange.close();
+        });
+        server.start();
+
+        CursorCloudAgentProvider provider = new CursorCloudAgentProvider();
+        AgentRun run = AgentRun.started(
+                UUID.randomUUID(),
+                UUID.randomUUID(),
+                ProviderType.CURSOR_CLOUD,
+                "bc-test-agent",
+                "run-test",
+                "cursor/feature"
+        );
+
+        AgentRun refreshed = provider.refreshRun(
+                run,
+                new AppSettings("cursor_test_key", "http://localhost:" + server.getAddress().getPort(), "")
+        );
+
+        assertEquals("https://github.com/acme/sample-repo/pull/42", refreshed.pullRequestUrl());
+        assertEquals(RunStatus.FINISHED, refreshed.status());
     }
 
     @Test

@@ -1,11 +1,14 @@
 package com.example.aiteamconsole;
 
+import com.fasterxml.jackson.annotation.JsonIgnoreProperties;
+
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.UUID;
 
+@JsonIgnoreProperties(ignoreUnknown = true)
 public record AgentTask(
         UUID id,
         String taskPrefix,
@@ -23,10 +26,29 @@ public record AgentTask(
         /** Last time the task transitioned into DONE. Cleared when re-running. */
         Instant endedAt,
         /** Tags chosen for this task. Resolved at run time to repository URLs via the repository registry. */
-        List<String> repositoryTags
+        List<String> repositoryTags,
+        /** Assignee / executor timeline (newest events appended at the end). */
+        List<TaskAssigneeHistoryEntry> assigneeHistory,
+        /**
+         * Ordered implementation pipeline: each wave may list multiple roles to run in parallel.
+         * Empty = legacy routing (task prefix + optional pinned assignee).
+         */
+        List<TaskFlowWave> developmentFlow,
+        /** Index of the wave to run next (0-based). Ignored when {@link #developmentFlow} is empty. */
+        int developmentFlowWaveIndex
 ) {
     public AgentTask {
         repositoryTags = normalizeTags(repositoryTags);
+        assigneeHistory = normalizeAssigneeHistory(assigneeHistory);
+        developmentFlow = normalizeDevelopmentFlow(developmentFlow);
+        if (developmentFlowWaveIndex < 0) {
+            developmentFlowWaveIndex = 0;
+        }
+        if (developmentFlow.isEmpty()) {
+            developmentFlowWaveIndex = 0;
+        } else if (developmentFlowWaveIndex > developmentFlow.size()) {
+            developmentFlowWaveIndex = developmentFlow.size();
+        }
     }
 
     public static AgentTask create(
@@ -54,7 +76,10 @@ public record AgentTask(
                 now,
                 null,
                 null,
-                normalizeTags(repositoryTags)
+                normalizeTags(repositoryTags),
+                List.of(),
+                List.of(),
+                0
         );
     }
 
@@ -109,7 +134,10 @@ public record AgentTask(
                 now,
                 nextStartedAt,
                 nextEndedAt,
-                repositoryTags
+                repositoryTags,
+                assigneeHistory,
+                developmentFlow,
+                developmentFlowWaveIndex
         );
     }
 
@@ -122,6 +150,43 @@ public record AgentTask(
             UUID nextAssignedAgentId,
             List<String> nextRepositoryTags
     ) {
+        return withEditableFields(
+                nextTaskPrefix,
+                nextTitle,
+                nextDescription,
+                nextRepositoryUrl,
+                nextStartingRef,
+                nextAssignedAgentId,
+                nextRepositoryTags,
+                null,
+                null
+        );
+    }
+
+    public AgentTask withEditableFields(
+            String nextTaskPrefix,
+            String nextTitle,
+            String nextDescription,
+            String nextRepositoryUrl,
+            String nextStartingRef,
+            UUID nextAssignedAgentId,
+            List<String> nextRepositoryTags,
+            List<TaskFlowWave> nextDevelopmentFlowOrNull,
+            Integer nextDevelopmentFlowWaveIndexOrNull
+    ) {
+        List<TaskFlowWave> nextFlow = nextDevelopmentFlowOrNull != null
+                ? normalizeDevelopmentFlow(nextDevelopmentFlowOrNull)
+                : developmentFlow;
+        int nextWave = nextDevelopmentFlowWaveIndexOrNull != null
+                ? nextDevelopmentFlowWaveIndexOrNull
+                : developmentFlowWaveIndex;
+        if (nextFlow.isEmpty()) {
+            nextWave = 0;
+        } else if (nextWave < 0) {
+            nextWave = 0;
+        } else if (nextWave > nextFlow.size()) {
+            nextWave = nextFlow.size();
+        }
         return new AgentTask(
                 id,
                 normalizePrefix(nextTaskPrefix),
@@ -136,8 +201,82 @@ public record AgentTask(
                 Instant.now(),
                 startedAt,
                 endedAt,
-                normalizeTags(nextRepositoryTags)
+                normalizeTags(nextRepositoryTags),
+                assigneeHistory,
+                nextFlow,
+                nextWave
         );
+    }
+
+    public AgentTask withDevelopmentFlowWaveIndex(int nextWaveIndex) {
+        int w = nextWaveIndex;
+        if (developmentFlow.isEmpty()) {
+            w = 0;
+        } else if (w < 0) {
+            w = 0;
+        } else if (w > developmentFlow.size()) {
+            w = developmentFlow.size();
+        }
+        return new AgentTask(
+                id,
+                taskPrefix,
+                taskNumber,
+                title,
+                description,
+                repositoryUrl,
+                startingRef,
+                assignedAgentId,
+                status,
+                createdAt,
+                updatedAt,
+                startedAt,
+                endedAt,
+                repositoryTags,
+                assigneeHistory,
+                developmentFlow,
+                w
+        );
+    }
+
+    public AgentTask withAssigneeHistoryEntryAppended(TaskAssigneeHistoryEntry entry) {
+        if (entry == null) {
+            return this;
+        }
+        List<TaskAssigneeHistoryEntry> next = new ArrayList<>(assigneeHistory);
+        next.add(entry);
+        return new AgentTask(
+                id,
+                taskPrefix,
+                taskNumber,
+                title,
+                description,
+                repositoryUrl,
+                startingRef,
+                assignedAgentId,
+                status,
+                createdAt,
+                updatedAt,
+                startedAt,
+                endedAt,
+                repositoryTags,
+                next,
+                developmentFlow,
+                developmentFlowWaveIndex
+        );
+    }
+
+    private static List<TaskFlowWave> normalizeDevelopmentFlow(List<TaskFlowWave> raw) {
+        if (raw == null || raw.isEmpty()) {
+            return List.of();
+        }
+        return List.copyOf(raw);
+    }
+
+    private static List<TaskAssigneeHistoryEntry> normalizeAssigneeHistory(List<TaskAssigneeHistoryEntry> raw) {
+        if (raw == null || raw.isEmpty()) {
+            return new ArrayList<>();
+        }
+        return new ArrayList<>(raw);
     }
 
     private static String normalizePrefix(String taskPrefix) {

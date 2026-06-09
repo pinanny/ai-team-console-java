@@ -2,6 +2,7 @@ package com.example.aiteamconsole;
 
 import org.junit.jupiter.api.Test;
 
+import java.time.Instant;
 import java.util.List;
 import java.util.UUID;
 
@@ -83,7 +84,7 @@ class AgentTaskTest {
                 "https://github.com/example/repo",
                 "main",
                 newAgent,
-                List.of("backend")
+                List.of()
         );
 
         assertEquals("Updated title", edited.title());
@@ -91,7 +92,18 @@ class AgentTaskTest {
         assertEquals(done.startedAt(), edited.startedAt());
         assertEquals(done.endedAt(), edited.endedAt());
         assertEquals(TaskStatus.DONE, edited.status());
-        assertEquals(List.of("backend"), edited.repositoryTags());
+        assertEquals(List.of(), edited.repositoryTags());
+        assertEquals(List.of(), edited.assigneeHistory());
+    }
+
+    @Test
+    void withAssigneeHistoryEntryAppendedKeepsOrder() {
+        AgentTask t = newDraft();
+        UUID aid = UUID.randomUUID();
+        TaskAssigneeHistoryEntry e1 = new TaskAssigneeHistoryEntry(Instant.parse("2024-01-01T12:00:00Z"), aid, "Run started");
+        TaskAssigneeHistoryEntry e2 = new TaskAssigneeHistoryEntry(Instant.parse("2024-01-01T13:00:00Z"), null, "Cleared");
+        AgentTask a = t.withAssigneeHistoryEntryAppended(e1).withAssigneeHistoryEntryAppended(e2);
+        assertEquals(List.of(e1, e2), a.assigneeHistory());
     }
 
     @Test

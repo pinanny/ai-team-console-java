@@ -14,7 +14,8 @@ final class RolePromptCatalog {
             AgentRole.QA_ENGINEER, "agent-prompts/qa-engineer.md",
             AgentRole.CODE_REVIEWER, "agent-prompts/code-reviewer.md",
             AgentRole.DEVOPS_ENGINEER, "agent-prompts/devops-engineer.md",
-            AgentRole.PRODUCT_ANALYST, "agent-prompts/product-analyst.md"
+            AgentRole.PRODUCT_ANALYST, "agent-prompts/product-analyst.md",
+            AgentRole.IMPLEMENTATION_PLANNER, "agent-prompts/implementation-planner.md"
     );
 
     static RolePromptCatalog defaultCatalog() {

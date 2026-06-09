@@ -3,16 +3,14 @@ package com.example.aiteamconsole.ui.tasks;
 import com.example.aiteamconsole.AgentProfile;
 import com.example.aiteamconsole.AgentTask;
 import com.example.aiteamconsole.ProviderRegistry;
-import com.example.aiteamconsole.TaskStatus;
+import com.example.aiteamconsole.TaskFlowWave;
+import com.example.aiteamconsole.Workspace;
 import com.example.aiteamconsole.ui.MainViewModel;
 
-import javafx.beans.property.BooleanProperty;
-import javafx.beans.property.ObjectProperty;
-import javafx.beans.property.SimpleBooleanProperty;
-import javafx.beans.property.SimpleObjectProperty;
-import javafx.beans.property.SimpleStringProperty;
-import javafx.beans.property.StringProperty;
+import javafx.collections.ListChangeListener;
+import javafx.collections.transformation.FilteredList;
 
+import java.util.List;
 import java.util.UUID;
 import java.util.function.Supplier;
 
@@ -24,15 +22,6 @@ public final class TasksViewModel {
 
     public final ObservableLists lists;
 
-    public final StringProperty formTitle = new SimpleStringProperty("");
-    public final StringProperty formDescription = new SimpleStringProperty("");
-    public final ObjectProperty<AgentProfile> formAgent = new SimpleObjectProperty<>();
-    public final ObjectProperty<TaskStatus> formStatus = new SimpleObjectProperty<>();
-    public final ObjectProperty<AgentTask> selected = new SimpleObjectProperty<>();
-
-    /** Mirrors legacy UI: after Edit, show save/start; after Create task, show create only. */
-    public final BooleanProperty taskFormIsEditMode = new SimpleBooleanProperty(false);
-
     public TasksViewModel(
             MainViewModel main,
             ProviderRegistry providerRegistry,
@@ -41,7 +30,15 @@ public final class TasksViewModel {
         this.main = main;
         this.providerRegistry = providerRegistry;
         this.settingsSupplier = settingsSupplier;
-        this.lists = new ObservableLists(main.agentProfiles, main.agentTasks, main.agentRuns);
+        FilteredList<AgentTask> visibleTasks = new FilteredList<>(main.agentTasks, main::taskMatchesActiveWorkspace);
+        Runnable bumpTaskFilter = () -> {
+            visibleTasks.setPredicate(null);
+            visibleTasks.setPredicate(main::taskMatchesActiveWorkspace);
+        };
+        main.activeWorkspaceIdProperty().addListener((obs, o, n) -> bumpTaskFilter.run());
+        main.workspaces.addListener((ListChangeListener<Workspace>) c -> bumpTaskFilter.run());
+        main.repositories.addListener((ListChangeListener<com.example.aiteamconsole.RepositoryEntry>) c -> bumpTaskFilter.run());
+        this.lists = new ObservableLists(main.agentProfiles, visibleTasks, main.agentRuns);
     }
 
     public record ObservableLists(
@@ -51,60 +48,75 @@ public final class TasksViewModel {
     ) {
     }
 
-    public void saveTask(
+    /**
+     * @return saved task, or {@code null} if validation failed
+     */
+    public AgentTask saveTaskReturningSaved(
             AgentTask tableSelected,
             String normalizedPrefixFromUi,
-            java.util.List<String> repositoryTagsFromUi,
+            String title,
+            String description,
+            List<String> repositoryTagsFromUi,
             String branchFromUi,
             boolean assignDeveloper,
-            UUID assignedAgentIdResolved
+            UUID assignedAgentIdResolved,
+            List<TaskFlowWave> developmentFlow,
+            int developmentFlowWaveIndex
     ) {
-        main.saveTaskFromInputs(
+        return main.saveTaskFromInputsReturningSaved(
                 tableSelected,
                 normalizedPrefixFromUi,
-                formTitle.get(),
-                formDescription.get(),
+                title,
+                description,
                 repositoryTagsFromUi,
                 branchFromUi,
                 assignDeveloper,
-                assignedAgentIdResolved
+                assignedAgentIdResolved,
+                developmentFlow,
+                developmentFlowWaveIndex
         );
     }
 
-    public void saveAndStartTask(
+    /**
+     * @return {@code true} if save succeeded and any intended start step completed (or was skipped per PA rule)
+     */
+    public boolean saveAndStartTask(
             AgentTask tableSelected,
             String normalizedPrefixFromUi,
-            java.util.List<String> repositoryTagsFromUi,
+            String title,
+            String description,
+            List<String> repositoryTagsFromUi,
             String branchFromUi,
             boolean assignDeveloper,
-            UUID assignedAgentIdResolved
+            UUID assignedAgentIdResolved,
+            List<TaskFlowWave> developmentFlow,
+            int developmentFlowWaveIndex
     ) {
+        boolean isNewTask = tableSelected == null;
         AgentTask saved = main.saveTaskFromInputsReturningSaved(
                 tableSelected,
                 normalizedPrefixFromUi,
-                formTitle.get(),
-                formDescription.get(),
+                title,
+                description,
                 repositoryTagsFromUi,
                 branchFromUi,
                 assignDeveloper,
-                assignedAgentIdResolved
+                assignedAgentIdResolved,
+                developmentFlow,
+                developmentFlowWaveIndex
         );
-        if (saved != null) {
-            main.startTask(saved);
+        if (saved == null) {
+            return false;
         }
+        if (isNewTask && main.hasProductAnalystAgent()) {
+            return true;
+        }
+        main.startTask(saved);
+        return true;
     }
 
     public void deleteTask(AgentTask task) {
         main.deleteTask(task);
-    }
-
-    public void clearForm() {
-        selected.set(null);
-        formTitle.set("");
-        formDescription.set("");
-        formAgent.set(null);
-        formStatus.set(null);
-        taskFormIsEditMode.set(false);
     }
 
     public ProviderRegistry providerRegistry() {

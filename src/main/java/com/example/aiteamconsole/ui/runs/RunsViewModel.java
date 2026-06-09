@@ -5,11 +5,13 @@ import com.example.aiteamconsole.AgentTask;
 import com.example.aiteamconsole.ProviderRegistry;
 import com.example.aiteamconsole.RunLogEntry;
 import com.example.aiteamconsole.TaskStatus;
+import com.example.aiteamconsole.Workspace;
 import com.example.aiteamconsole.ui.MainViewModel;
 
 import javafx.beans.property.ObjectProperty;
 import javafx.beans.property.SimpleObjectProperty;
 import javafx.collections.FXCollections;
+import javafx.collections.ListChangeListener;
 import javafx.collections.ObservableList;
 import javafx.collections.transformation.FilteredList;
 import javafx.collections.transformation.SortedList;
@@ -46,10 +48,21 @@ public final class RunsViewModel {
         this.settingsSupplier = settingsSupplier;
         this.runsBacking = main.agentRuns;
         this.tasksBacking = main.agentTasks;
-        this.filtered = new FilteredList<>(runsBacking, r -> matchesTaskStatusFilter(r));
+        this.filtered = new FilteredList<>(runsBacking, this::matchesFilters);
         this.sorted = new SortedList<>(filtered);
         main.agentTasks.addListener((javafx.collections.ListChangeListener<AgentTask>) c -> refreshFilteredPredicate());
         taskStatusFilter.addListener((obs, o, n) -> refreshFilteredPredicate());
+        main.activeWorkspaceIdProperty().addListener((obs, o, n) -> refreshFilteredPredicate());
+        main.workspaces.addListener((ListChangeListener<Workspace>) c -> refreshFilteredPredicate());
+        main.repositories.addListener((ListChangeListener<com.example.aiteamconsole.RepositoryEntry>) c -> refreshFilteredPredicate());
+    }
+
+    private boolean matchesFilters(AgentRun r) {
+        return matchesTaskStatusFilter(r) && matchesWorkspaceFilter(r);
+    }
+
+    private boolean matchesWorkspaceFilter(AgentRun r) {
+        return main.findTask(r.taskId()).map(main::taskMatchesActiveWorkspace).orElse(false);
     }
 
     private boolean matchesTaskStatusFilter(AgentRun r) {
@@ -64,7 +77,7 @@ public final class RunsViewModel {
 
     public void refreshFilteredPredicate() {
         filtered.setPredicate(null);
-        filtered.setPredicate(this::matchesTaskStatusFilter);
+        filtered.setPredicate(this::matchesFilters);
     }
 
     public void cancelRun() {

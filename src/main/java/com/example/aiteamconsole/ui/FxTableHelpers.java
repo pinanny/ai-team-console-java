@@ -50,8 +50,8 @@ public final class FxTableHelpers {
                 double max = textWidth(column.getText()) + 28;
                 for (T row : table.getItems()) {
                     Object cellValue = column.getCellData(row);
-                    String text = cellValue == null ? "" : cellValue.toString();
-                    max = Math.max(max, textWidth(text) + 28);
+                    String text = stringForAutoSizeMeasurement(cellValue);
+                    max = Math.max(max, maxLineTextWidth(text) + 28);
                 }
                 double clamped = Math.min(Math.max(max, 60), 520);
                 column.setPrefWidth(clamped);
@@ -66,6 +66,32 @@ public final class FxTableHelpers {
             return 0;
         }
         return new Text(text).getLayoutBounds().getWidth();
+    }
+
+    /** Widest line (for multiline cell values used in auto-size). */
+    public static double maxLineTextWidth(String text) {
+        if (text == null || text.isEmpty()) {
+            return 0;
+        }
+        double m = 0;
+        for (String line : text.split("\\R", -1)) {
+            m = Math.max(m, textWidth(line));
+        }
+        return m;
+    }
+
+    /**
+     * Text used when measuring column width so it matches what users see
+     * (e.g. {@link Instant} uses table time format, not ISO-8601).
+     */
+    public static String stringForAutoSizeMeasurement(Object cellValue) {
+        if (cellValue == null) {
+            return "";
+        }
+        if (cellValue instanceof Instant i) {
+            return formatOptionalTime(i);
+        }
+        return cellValue.toString();
     }
 
     public static VBox padded(VBox content) {

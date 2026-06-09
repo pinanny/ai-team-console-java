@@ -43,6 +43,16 @@ public final class AlertUserDialogs implements UserDialogs {
     }
 
     @Override
+    public void showWarning(String headerText, String message) {
+        Alert alert = new Alert(Alert.AlertType.WARNING);
+        alert.setTitle("AI Team Console");
+        alert.setHeaderText(headerText);
+        alert.setContentText(message == null ? "" : message);
+        alert.getDialogPane().setPrefWidth(560);
+        alert.showAndWait();
+    }
+
+    @Override
     public boolean confirm(String title, String headerText, String contentText) {
         Alert confirm = new Alert(Alert.AlertType.CONFIRMATION);
         confirm.setTitle(title);

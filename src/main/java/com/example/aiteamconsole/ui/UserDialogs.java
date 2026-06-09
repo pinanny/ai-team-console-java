@@ -8,5 +8,7 @@ public interface UserDialogs {
 
     void showInfo(String message);
 
+    void showWarning(String headerText, String message);
+
     boolean confirm(String title, String headerText, String contentText);
 }

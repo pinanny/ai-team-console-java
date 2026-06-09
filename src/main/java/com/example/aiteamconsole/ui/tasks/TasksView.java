@@ -1,41 +1,36 @@
 package com.example.aiteamconsole.ui.tasks;
 
-import com.example.aiteamconsole.AgentProfile;
+import com.example.aiteamconsole.AgentRun;
 import com.example.aiteamconsole.AgentTask;
 import com.example.aiteamconsole.RepositoryEntry;
-import com.example.aiteamconsole.TagSelectionControl;
-import com.example.aiteamconsole.TaskRepositoryTagPicker;
 import com.example.aiteamconsole.TaskStatus;
 import com.example.aiteamconsole.ui.FxTableHelpers;
 import com.example.aiteamconsole.ui.MainViewModel;
+import com.example.aiteamconsole.ui.PullRequestLinkLabels;
 
-import javafx.collections.FXCollections;
+import javafx.collections.ListChangeListener;
+import javafx.beans.property.SimpleStringProperty;
 import javafx.scene.Node;
 import javafx.scene.control.Button;
-import javafx.scene.control.CheckBox;
-import javafx.scene.control.ComboBox;
+import javafx.scene.control.ChoiceDialog;
+import javafx.scene.control.Hyperlink;
 import javafx.scene.control.Label;
 import javafx.scene.control.Separator;
 import javafx.scene.control.TableCell;
 import javafx.scene.control.TableColumn;
+import javafx.scene.control.TableRow;
 import javafx.scene.control.TableView;
-import javafx.scene.control.TextArea;
-import javafx.scene.control.TextField;
-import javafx.scene.layout.GridPane;
+import javafx.scene.control.Tooltip;
 import javafx.scene.layout.HBox;
-import javafx.scene.layout.Priority;
+import javafx.scene.layout.Region;
 import javafx.scene.layout.VBox;
-import javafx.stage.FileChooser;
+import javafx.scene.input.MouseButton;
 
-import java.io.File;
-import java.io.IOException;
-import java.nio.charset.StandardCharsets;
-import java.nio.file.Files;
+import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.List;
 import java.util.Optional;
-import java.util.UUID;
 import java.util.function.Predicate;
-import java.util.logging.Level;
 
 public final class TasksView {
 
@@ -52,273 +47,178 @@ public final class TasksView {
         table.getColumns().add(FxTableHelpers.textColumn("Key", AgentTask::taskKey, 110));
         table.getColumns().add(FxTableHelpers.textColumn("Title", AgentTask::title, 240));
         table.getColumns().add(FxTableHelpers.textColumn("Status", task -> task.status().name(), 120));
-        table.getColumns().add(FxTableHelpers.textColumn("Role", task -> MainViewModel.roleForTaskPrefix(task.taskPrefix()).map(com.example.aiteamconsole.AgentRole::label).orElse("Any"), 150));
-        table.getColumns().add(FxTableHelpers.textColumn("Agent", task -> main.agentName(task.assignedAgentId()), 180));
-        table.getColumns().add(FxTableHelpers.textColumn("Tags", task -> RepositoryEntry.formatTags(task.repositoryTags()), 160));
+        table.getColumns().add(FxTableHelpers.textColumn("Assigned", task -> main.agentName(task.assignedAgentId()), 200));
+        table.getColumns().add(taskPullRequestColumn(main));
+
+        vm.lists.runs().addListener((ListChangeListener<AgentRun>) c -> table.refresh());
         table.getColumns().add(FxTableHelpers.textColumn("Started", task -> FxTableHelpers.formatOptionalTime(task.startedAt()), 160));
         table.getColumns().add(FxTableHelpers.textColumn("Ended", task -> FxTableHelpers.formatOptionalTime(task.endedAt()), 160));
 
-        ComboBox<String> prefix = new ComboBox<>(FXCollections.observableArrayList("BE-TASK", "FE-TASK", "QA-TASK", "REV-TASK", "DEVOPS-TASK"));
-        prefix.setEditable(true);
-        prefix.getSelectionModel().select("BE-TASK");
+        Predicate<AgentTask> backlogRunEnabled = t ->
+                (t.status() == TaskStatus.DRAFT || t.status() == TaskStatus.OPEN) && !main.hasActiveRunForTask(t.id());
 
-        TextField title = new TextField();
-        title.setPromptText("Add TTL support to cache");
-        title.textProperty().bindBidirectional(vm.formTitle);
-
-        TextArea description = new TextArea();
-        description.setPromptText("Acceptance criteria, constraints, test expectations...");
-        description.setPrefRowCount(5);
-        description.textProperty().bindBidirectional(vm.formDescription);
-
-        TagSelectionControl tagPicker = new TaskRepositoryTagPicker(main.repositories);
-
-        ComboBox<String> branchName = new ComboBox<>();
-        branchName.setEditable(true);
-        branchName.setPromptText("Choose branch...");
-        branchName.setDisable(true);
-        branchName.getItems().addAll("main");
-        CheckBox specifyBranch = new CheckBox("Specify branch");
-        Button refreshBranches = new Button("Refresh branches");
-        refreshBranches.setDisable(true);
-        refreshBranches.setOnAction(event -> main.refreshBranchesForTags(tagPicker.selected(), branches -> {
-            String current = branchName.getEditor().getText();
-            branchName.getItems().setAll(branches);
-            if (current != null && !current.isBlank()) {
-                branchName.getEditor().setText(current);
-            }
-        }));
-        specifyBranch.selectedProperty().addListener((obs, wasSelected, isSelected) -> {
-            branchName.setDisable(!isSelected);
-            refreshBranches.setDisable(!isSelected);
-            if (isSelected) {
-                main.refreshBranchesForTags(tagPicker.selected(), branches -> {
-                    String current = branchName.getEditor().getText();
-                    branchName.getItems().setAll(branches);
-                    if (current != null && !current.isBlank()) {
-                        branchName.getEditor().setText(current);
+        table.setRowFactory(tv -> {
+            TableRow<AgentTask> row = new TableRow<>();
+            row.setOnMouseClicked(event -> {
+                if (event.getClickCount() != 2
+                        || row.isEmpty()
+                        || event.getButton() != MouseButton.PRIMARY) {
+                    return;
+                }
+                Node target = event.getPickResult().getIntersectedNode();
+                for (Node n = target; n != null && n != row; n = n.getParent()) {
+                    if (n instanceof Button) {
+                        return;
                     }
+                }
+                TaskFormDialog.open(vm, main.primaryStage(), row.getItem(), () -> {
                 });
-            } else {
-                branchName.getSelectionModel().clearSelection();
-                branchName.getEditor().clear();
-            }
+            });
+            return row;
         });
-
-        ComboBox<AgentProfile> agentSelector = new ComboBox<>(vm.lists.profiles());
-        agentSelector.setConverter(FxTableHelpers.agentConverter());
-        CheckBox assignDeveloper = new CheckBox("Assign developer");
-        agentSelector.setDisable(true);
-        assignDeveloper.selectedProperty().addListener((obs, wasSelected, isSelected) -> {
-            agentSelector.setDisable(!isSelected);
-            if (!isSelected) {
-                agentSelector.getSelectionModel().clearSelection();
-            }
-        });
-
-        Predicate<AgentTask> draftRunEnabled = t -> t.status() == TaskStatus.DRAFT && !main.hasActiveRunForTask(t.id());
+        table.setTooltip(new Tooltip("Double-click a row to open the task (review spec, edit fields, save)."));
 
         table.getColumns().add(taskActionsColumn(
-                task -> loadEditorsFromTask(task, prefix, tagPicker, specifyBranch, branchName, assignDeveloper, agentSelector),
+                task -> TaskFormDialog.open(vm, main.primaryStage(), task, () -> {
+                }),
+                task -> main.acceptSpecAndOpen(task),
+                task -> OpenQuestionsDialog.open(main, main.primaryStage(), task),
                 task -> vm.deleteTask(task),
+                task -> TaskFormDialog.open(vm, main.primaryStage(), task, () -> {
+                }),
                 task -> main.startTask(task),
-                draftRunEnabled
+                backlogRunEnabled
         ));
 
-        Button create = new Button("Create task");
-        create.setOnAction(event -> {
-            UUID assignedId = resolveAssignedAgentId(assignDeveloper, agentSelector);
-            if (assignDeveloper.isSelected() && assignedId == null) {
+        Button createTask = new Button("Create task");
+        createTask.setOnAction(event -> TaskFormDialog.open(vm, main.primaryStage(), null, () ->
+                table.getSelectionModel().clearSelection()));
+
+        Button analyzeDomain = new Button("Analyze domain");
+        analyzeDomain.setTooltip(new javafx.scene.control.Tooltip(
+                "Analyze the repository once to build project memory.\n"
+                        + "Saves architecture, stack, and domain context so agents skip\n"
+                        + "full codebase re-analysis on every task (saves 80–90% tokens)."));
+        analyzeDomain.setOnAction(event -> {
+            List<RepositoryEntry> repos = new ArrayList<>(main.repositoriesInActiveWorkspace);
+            if (repos.isEmpty()) {
+                if (main.getActiveWorkspaceId() != null) {
+                    main.dialogs().showError(
+                            "No repositories in this workspace. Add repos under Cursor / GitHub settings, "
+                                    + "then assign them in Manage workspaces…, or choose «All workspaces».");
+                } else {
+                    main.dialogs().showError(
+                            "No repositories configured. Add a repository in GitHub / Cursor settings first.");
+                }
                 return;
             }
-            vm.saveTask(
-                    null,
-                    MainViewModel.normalizeTaskPrefix(prefix.getEditor().getText()),
-                    tagPicker.selected(),
-                    branchValue(specifyBranch, branchName),
-                    assignDeveloper.isSelected(),
-                    assignedId
-            );
-            title.clear();
-            description.clear();
-            tagPicker.setSelected(List.of());
-            branchName.getEditor().clear();
-            specifyBranch.setSelected(false);
-            assignDeveloper.setSelected(false);
-            vm.taskFormIsEditMode.set(false);
-            table.getSelectionModel().clearSelection();
+            RepositoryEntry chosen;
+            if (repos.size() == 1) {
+                chosen = repos.get(0);
+            } else {
+                // Multiple repos — ask the user which one to analyze
+                List<String> labels = repos.stream()
+                        .map(RepositoryEntry::label)
+                        .toList();
+                ChoiceDialog<String> picker = new ChoiceDialog<>(labels.get(0), labels);
+                picker.setTitle("Analyze domain");
+                picker.setHeaderText("Select a repository to analyze");
+                picker.setContentText("Repository:");
+                Optional<String> result = picker.showAndWait();
+                if (result.isEmpty()) {
+                    return; // user cancelled
+                }
+                String picked = result.get();
+                chosen = repos.stream()
+                        .filter(r -> r.label().equals(picked))
+                        .findFirst()
+                        .orElse(null);
+                if (chosen == null) {
+                    return;
+                }
+            }
+            // Confirm if memory already exists — re-analyzing will overwrite it
+            main.analyzeProjectMemoryWithOverwriteConfirm(chosen);
         });
-
-        Button saveChanges = new Button("Save changes");
-        saveChanges.setOnAction(event -> {
-            AgentTask sel = table.getSelectionModel().getSelectedItem();
-            if (sel == null) {
-                main.dialogs().showError("Select a task first.");
-                return;
-            }
-            UUID assignedId = resolveAssignedAgentId(assignDeveloper, agentSelector);
-            if (assignDeveloper.isSelected() && assignedId == null) {
-                return;
-            }
-            vm.saveTask(
-                    sel,
-                    MainViewModel.normalizeTaskPrefix(prefix.getEditor().getText()),
-                    tagPicker.selected(),
-                    branchValue(specifyBranch, branchName),
-                    assignDeveloper.isSelected(),
-                    assignedId
-            );
-        });
-
-        Button start = new Button("Save&Start");
-        start.setOnAction(event -> {
-            AgentTask sel = table.getSelectionModel().getSelectedItem();
-            UUID assignedId = resolveAssignedAgentId(assignDeveloper, agentSelector);
-            if (assignDeveloper.isSelected() && assignedId == null) {
-                return;
-            }
-            vm.saveAndStartTask(
-                    sel,
-                    MainViewModel.normalizeTaskPrefix(prefix.getEditor().getText()),
-                    tagPicker.selected(),
-                    branchValue(specifyBranch, branchName),
-                    assignDeveloper.isSelected(),
-                    assignedId
-            );
-        });
-
-        GridPane form = new GridPane();
-        form.setHgap(8);
-        form.setVgap(8);
-        form.addRow(0, new Label("Prefix"), prefix, assignDeveloper, agentSelector);
-        form.addRow(1, new Label("Title"), title, specifyBranch, branchName, refreshBranches);
-        form.addRow(2, new Label("Repositories"), tagPicker.node());
-        GridPane.setColumnSpan(tagPicker.node(), 4);
-        Button importDescriptionMd = new Button("Import description from .md file…");
-        importDescriptionMd.setOnAction(e -> importMarkdownAsTaskDescription(description));
-        VBox descriptionBox = new VBox(6, importDescriptionMd, description);
-        VBox.setVgrow(description, Priority.ALWAYS);
-        form.add(new Label("Description"), 0, 3);
-        form.add(descriptionBox, 1, 3, 4, 1);
-        form.addRow(4, create, saveChanges, start);
-        GridPane.setHgrow(title, Priority.ALWAYS);
-        GridPane.setHgrow(descriptionBox, Priority.ALWAYS);
-
-        Runnable refreshTaskFormActionButtons = () -> {
-            boolean edit = vm.taskFormIsEditMode.get();
-            create.setVisible(!edit);
-            create.setManaged(!edit);
-            saveChanges.setVisible(edit);
-            saveChanges.setManaged(edit);
-            start.setVisible(edit);
-            start.setManaged(edit);
-        };
-        vm.taskFormIsEditMode.addListener((obs, was, isNow) -> refreshTaskFormActionButtons.run());
-        refreshTaskFormActionButtons.run();
 
         FxTableHelpers.autoSizeColumnsToContent(table);
-        return FxTableHelpers.padded(new VBox(10, table, new Separator(), form));
+        HBox toolbar = new HBox(8, createTask, analyzeDomain);
+        Label scopeHint = new Label(
+                "Use Workspace in the top bar to focus one product. Tasks appear if their repository tags overlap that workspace.");
+        scopeHint.setWrapText(true);
+        scopeHint.setStyle("-fx-text-fill: #555; -fx-font-size: 11px;");
+        return FxTableHelpers.padded(new VBox(10, scopeHint, table, new Separator(), toolbar));
     }
 
-    private void importMarkdownAsTaskDescription(TextArea description) {
-        FileChooser chooser = new FileChooser();
-        chooser.setTitle("Open Markdown file");
-        chooser.getExtensionFilters().addAll(
-                new FileChooser.ExtensionFilter("Markdown", "*.md", "*.markdown"),
-                new FileChooser.ExtensionFilter("All files", "*.*"));
-        File file = chooser.showOpenDialog(vm.main().primaryStage());
-        if (file == null) {
-            return;
-        }
-        try {
-            String text = Files.readString(file.toPath(), StandardCharsets.UTF_8);
-            description.setText(text);
-        } catch (IOException ex) {
-            com.example.aiteamconsole.AppLogging.get(TasksView.class).log(Level.WARNING, "Failed to read markdown for task description", ex);
-            vm.main().dialogs().showError("Could not read file: " + ex.getMessage());
-        }
-    }
+    private static TableColumn<AgentTask, String> taskPullRequestColumn(MainViewModel main) {
+        TableColumn<AgentTask, String> col = new TableColumn<>("PR");
+        col.setMinWidth(72);
+        col.setPrefWidth(88);
+        col.setMaxWidth(120);
+        col.setCellValueFactory(cd -> {
+            String url = main.pullRequestUrlForTask(cd.getValue()).orElse("");
+            return new SimpleStringProperty(url);
+        });
+        col.setCellFactory(ignored -> new TableCell<>() {
+            private final Hyperlink link = new Hyperlink();
 
-    private static String branchValue(CheckBox specifyBranch, ComboBox<String> branchName) {
-        if (!specifyBranch.isSelected()) {
-            return "";
-        }
-        String value = branchName.getEditor().getText();
-        if (value == null || value.isBlank()) {
-            value = branchName.getValue();
-        }
-        return value == null ? "" : value.strip();
-    }
-
-    private UUID resolveAssignedAgentId(CheckBox assignDeveloper, ComboBox<AgentProfile> agentSelector) {
-        if (!assignDeveloper.isSelected()) {
-            return null;
-        }
-        AgentProfile selectedAgent = agentSelector.getValue();
-        if (selectedAgent == null) {
-            vm.main().dialogs().showError("Choose an agent or uncheck Assign developer.");
-            return null;
-        }
-        return selectedAgent.id();
-    }
-
-    private void loadEditorsFromTask(
-            AgentTask selected,
-            ComboBox<String> prefix,
-            TagSelectionControl tagPicker,
-            CheckBox specifyBranch,
-            ComboBox<String> branchName,
-            CheckBox assignDeveloper,
-            ComboBox<AgentProfile> agentSelector
-    ) {
-        MainViewModel main = vm.main();
-        if (!main.canEditTask(selected)) {
-            main.dialogs().showError("Only tasks that are not in progress can be edited.");
-            return;
-        }
-        vm.selected.set(selected);
-        vm.formTitle.set(selected.title());
-        vm.formDescription.set(selected.description());
-        prefix.getEditor().setText(selected.taskPrefix());
-        tagPicker.setSelected(selected.repositoryTags());
-        if (selected.startingRef() != null && !selected.startingRef().isBlank()) {
-            specifyBranch.setSelected(true);
-            branchName.getEditor().setText(selected.startingRef());
-        } else {
-            specifyBranch.setSelected(false);
-            branchName.getEditor().clear();
-        }
-        Optional<AgentProfile> agent = main.findAgent(selected.assignedAgentId());
-        assignDeveloper.setSelected(agent.isPresent());
-        agent.ifPresent(agentSelector::setValue);
-        if (agent.isEmpty()) {
-            agentSelector.getSelectionModel().clearSelection();
-        }
-        vm.taskFormIsEditMode.set(true);
+            @Override
+            protected void updateItem(String item, boolean empty) {
+                super.updateItem(item, empty);
+                setText(null);
+                if (empty) {
+                    setGraphic(null);
+                    setTooltip(null);
+                    return;
+                }
+                if (item == null || item.isBlank()) {
+                    Label dash = new Label("—");
+                    dash.setStyle("-fx-text-fill: #888;");
+                    setGraphic(dash);
+                    setTooltip(null);
+                    return;
+                }
+                final String url = item.strip();
+                link.setText(PullRequestLinkLabels.compactLabel(url));
+                link.setTooltip(new Tooltip(PullRequestLinkLabels.tooltipForUrl(url).orElse(url)));
+                link.setOnAction(e -> main.openUrl(url));
+                setGraphic(link);
+            }
+        });
+        col.setComparator(Comparator.comparing((String u) -> u == null || u.isBlank())
+                .thenComparing(u -> PullRequestLinkLabels.compactLabel(u), String.CASE_INSENSITIVE_ORDER));
+        return col;
     }
 
     private static TableColumn<AgentTask, Void> taskActionsColumn(
             java.util.function.Consumer<AgentTask> editAction,
+            java.util.function.Consumer<AgentTask> acceptSpecAction,
+            java.util.function.Consumer<AgentTask> createTicketsAction,
             java.util.function.Consumer<AgentTask> deleteAction,
+            java.util.function.Consumer<AgentTask> assignAction,
             java.util.function.Consumer<AgentTask> runAction,
-            Predicate<AgentTask> draftRunEnabled
+            Predicate<AgentTask> backlogRunEnabled
     ) {
-        TableColumn<AgentTask, Void> column = new TableColumn<>("Actions");
-        column.setMinWidth(248);
-        column.setPrefWidth(260);
+        TableColumn<AgentTask, Void> column = new TableColumn<>("");
+        column.setMinWidth(168);
+        column.setPrefWidth(188);
+        column.setMaxWidth(220);
         column.setUserData("fixed-width");
         column.setCellFactory(ignored -> new TableCell<>() {
-            private final Button run = new Button("Run");
-            private final Button edit = new Button("Edit");
-            private final Button delete = new Button("Delete");
+            private final Button assign = actionButton("Assign", "Pick implementation agent for Run");
+            private final Button run = actionButton("Run", "Start agent run");
+            private final Button acceptSpec = actionButton("Accept", "Accept Product Analyst spec and open task");
+            private final Button createTickets = actionButton("OQ", "Create DRAFT tasks from open questions (OQ- prefix)");
+            private final Button edit = actionButton("Edit", "Open task form");
+            private final Button delete = actionButton("Delete", "Delete task and local runs");
             private final HBox buttons;
 
             {
-                run.setMinWidth(48);
-                edit.setMinWidth(56);
-                delete.setMinWidth(64);
-                buttons = new HBox(6, run, edit, delete);
+                buttons = new HBox(4, run, assign, acceptSpec, createTickets, edit, delete);
+                assign.setOnAction(event -> assignAction.accept(getTableView().getItems().get(getIndex())));
                 run.setOnAction(event -> runAction.accept(getTableView().getItems().get(getIndex())));
+                acceptSpec.setOnAction(event -> acceptSpecAction.accept(getTableView().getItems().get(getIndex())));
+                createTickets.setOnAction(event -> createTicketsAction.accept(getTableView().getItems().get(getIndex())));
                 edit.setOnAction(event -> editAction.accept(getTableView().getItems().get(getIndex())));
                 delete.setOnAction(event -> deleteAction.accept(getTableView().getItems().get(getIndex())));
             }
@@ -331,13 +231,33 @@ public final class TasksView {
                     return;
                 }
                 AgentTask task = getTableView().getItems().get(getIndex());
-                boolean draft = task.status() == TaskStatus.DRAFT;
-                run.setVisible(draft);
-                run.setManaged(draft);
-                run.setDisable(!draftRunEnabled.test(task));
+                boolean backlog = task.status() == TaskStatus.DRAFT || task.status() == TaskStatus.OPEN;
+                boolean specReview = task.status() == TaskStatus.SPEC_REVIEW;
+                boolean showAssign = backlog && task.status() == TaskStatus.OPEN && task.assignedAgentId() == null;
+                boolean showRun = backlog && !showAssign;
+                boolean canRun = backlogRunEnabled.test(task);
+                assign.setVisible(showAssign);
+                assign.setManaged(showAssign);
+                assign.setDisable(!canRun);
+                run.setVisible(showRun);
+                run.setManaged(showRun);
+                run.setDisable(!canRun);
+                acceptSpec.setVisible(specReview);
+                acceptSpec.setManaged(specReview);
+                createTickets.setVisible(specReview);
+                createTickets.setManaged(specReview);
                 setGraphic(buttons);
             }
         });
         return column;
+    }
+
+    private static Button actionButton(String text, String tooltip) {
+        Button b = new Button(text);
+        b.setTooltip(new Tooltip(tooltip));
+        b.setMinWidth(Region.USE_PREF_SIZE);
+        b.setPrefWidth(Region.USE_COMPUTED_SIZE);
+        b.setMaxWidth(Region.USE_PREF_SIZE);
+        return b;
     }
 }

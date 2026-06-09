@@ -28,6 +28,7 @@ public final class OllamaAgentProvider implements AgentProvider {
     private final Path workspaceRoot;
     private volatile RepositoryResolver repositoryResolver = RepositoryResolver.DEFAULT;
     private volatile OllamaRuntimeSettings runtimeSettings = OllamaRuntimeSettings.defaults();
+    private volatile ProjectMemoryStore projectMemoryStore = ProjectMemoryStore.defaultStore();
 
     private final ConcurrentHashMap<UUID, OllamaJob> jobs = new ConcurrentHashMap<>();
 
@@ -50,8 +51,22 @@ public final class OllamaAgentProvider implements AgentProvider {
         this.runtimeSettings = settings == null ? OllamaRuntimeSettings.defaults() : settings.normalized();
     }
 
+    /**
+     * Overrides the project memory store (e.g. for a tenant-specific path or in tests).
+     * Defaults to {@link ProjectMemoryStore#defaultStore()}.
+     */
+    public void setProjectMemoryStore(ProjectMemoryStore store) {
+        this.projectMemoryStore = store == null ? ProjectMemoryStore.defaultStore() : store;
+    }
+
+    /** Exposes the HTTP client for UI-level operations (model list, pull). */
+    public OllamaHttpClient ollamaHttp() {
+        return ollamaHttp;
+    }
+
     @Override
-    public AgentRun startTask(AgentProfile agent, AgentTask task, AppSettings ignored) throws AgentProviderException {
+    public AgentRun startTask(AgentProfile agent, AgentTask task, AppSettings ignored, TaskLaunchHints hints)
+            throws AgentProviderException {
         OllamaRuntimeSettings cfg = runtimeSettings;
         List<String> repos = repositoryResolver.resolve(task, agent);
         List<String> resolved = new ArrayList<>();
@@ -102,7 +117,7 @@ public final class OllamaAgentProvider implements AgentProvider {
                 "ollama",
                 "local-" + UUID.randomUUID(),
                 branchName
-        ).appendLog("Ollama base: " + cfg.ollamaBaseUrl() + ", model: " + cfg.ollamaModel())
+        ).appendLog("Ollama base: " + cfg.ollamaBaseUrl() + ", model: " + resolveModel(agent, cfg))
                 .appendLog("Head branch (git/push): " + branchName + headBranch.mismatchNoteForLogs());
 
         OllamaJob job = new OllamaJob();
@@ -184,19 +199,48 @@ public final class OllamaAgentProvider implements AgentProvider {
             }
             LocalGitOperations.runGit(repoRoot, "checkout", "-b", branchName);
 
-            String layout = PatchParseUtil.summarizeRepository(repoRoot, 400, 120);
-            String qdrantCtx = "";
-            if (cfg.qdrantEnabled() && cfg.qdrantBaseUrl() != null && !cfg.qdrantBaseUrl().isBlank()) {
-                job.log("Indexing codebase into Qdrant collection " + qCollection + "…");
-                qdrantCtx = buildQdrantContext(repoRoot, cfg, qCollection, task);
+            // ──────────────────────────────────────────────────────────────
+            // Planner / executor split detection.
+            // If the task description contains a pre-approved plan (PLAN_START…PLAN_END),
+            // we use the executor prompt — much smaller, no layout/qdrant bloat — and
+            // run a verifier pass after the patch is applied. Otherwise: classic flow.
+            // ──────────────────────────────────────────────────────────────
+            String planBody = AgentTaskPrompts.extractImplementationPlan(task.description());
+            boolean executorMode = !planBody.isBlank();
+
+            String layout;
+            String qdrantCtx;
+            String userPrompt;
+            String system;
+            ProjectMemorySnapshot memory = loadMemoryForTask(task, agent);
+
+            if (executorMode) {
+                job.log("Pre-approved plan detected in task description (" + planBody.length()
+                        + " chars). Switching to executor mode — skipping repository layout and Qdrant retrieval.");
+                layout = "";
+                qdrantCtx = "";
+                userPrompt = AgentTaskPrompts.buildOllamaExecutorPromptFromPlan(task, planBody);
+                system = "You are a code-rewrite executor. You output only a valid git unified diff applicable at repo root, or the line NO_PATCH. You never invent files, APIs, or refactors that are not in the plan.";
+            } else {
+                layout = PatchParseUtil.summarizeRepository(repoRoot, 400, 120);
+                qdrantCtx = "";
+                if (cfg.qdrantEnabled() && cfg.qdrantBaseUrl() != null && !cfg.qdrantBaseUrl().isBlank()) {
+                    job.log("Indexing codebase into Qdrant collection " + qCollection + "…");
+                    qdrantCtx = buildQdrantContext(repoRoot, cfg, qCollection, task);
+                }
+                // Load pre-analyzed project memory to avoid full codebase re-analysis on every run
+                userPrompt = AgentTaskPrompts.buildOllamaCoderUserPrompt(agent, task, baseBranch, branchName, layout, qdrantCtx, memory);
+                system = "You output only a valid git unified diff applicable at repo root, or the line NO_PATCH.";
             }
 
-            String userPrompt = AgentTaskPrompts.buildOllamaCoderUserPrompt(agent, task, baseBranch, branchName, layout, qdrantCtx);
-            String system = "You output only a valid git unified diff applicable at repo root, or the line NO_PATCH.";
-
             job.log("Calling Ollama…");
-            String raw = ollamaHttp.chat(cfg.ollamaBaseUrl(), cfg.ollamaModel(), system, userPrompt);
+            OllamaHttpClient.OllamaChatResult result = ollamaHttp.chatWithMetrics(
+                    cfg.ollamaBaseUrl(), resolveModel(agent, cfg), system, userPrompt);
+            job.addTokens(result);
+            String raw = result.content();
             job.log("Model response length: " + raw.length() + " chars");
+            job.log("Executor tokens: prompt=" + result.promptEvalCount() + ", completion=" + result.evalCount()
+                    + (executorMode ? " (executor mode)" : " (classic mode)"));
 
             String diff = PatchParseUtil.extractUnifiedDiff(raw);
             if (diff.isBlank()) {
@@ -216,6 +260,11 @@ public final class OllamaAgentProvider implements AgentProvider {
                     dumpFailedPatch(run.id(), raw, diff, applyErr.getMessage(), job);
                     throw applyErr;
                 }
+            }
+
+            // Verifier pass — only meaningful in executor mode (a plan provides the checklist).
+            if (executorMode) {
+                runVerifierPass(cfg, task, planBody, diff, job);
             }
             String msg = "%s %s".formatted(task.taskKey(), task.title()).strip();
             if (msg.length() > 200) {
@@ -261,6 +310,80 @@ public final class OllamaAgentProvider implements AgentProvider {
                 LOG.log(Level.FINE, "cleanup", e);
             }
         }
+    }
+
+    /**
+     * Runs a second, cheap Ollama pass that verifies the applied diff against the plan's
+     * VERIFICATION_CHECKLIST. The verifier emits a single JSON line; we parse it best-effort
+     * and append a {@code [VERIFIER]} log line. We never block the run — verifier failures
+     * become a visible warning in the run log so the operator can decide what to do.
+     *
+     * <p>The verifier prompt is small (≈1–2 k tokens) so the cost is negligible compared
+     * to the executor pass it follows.
+     */
+    private void runVerifierPass(
+            OllamaRuntimeSettings cfg,
+            AgentTask task,
+            String planBody,
+            String diff,
+            OllamaJob job
+    ) {
+        job.log("Running verifier pass…");
+        String verifierPrompt = AgentTaskPrompts.buildOllamaVerifierPromptFromPlan(task, planBody, diff);
+        String verifierSystem = "You are a code-review verifier. You output exactly one JSON object on a single line. No prose.";
+        try {
+            OllamaHttpClient.OllamaChatResult vr = ollamaHttp.chatWithMetrics(
+                    cfg.ollamaBaseUrl(), resolveModel(agent, cfg), verifierSystem, verifierPrompt);
+            job.addTokens(vr);
+            job.log("Verifier tokens: prompt=" + vr.promptEvalCount() + ", completion=" + vr.evalCount());
+            VerifierVerdict verdict = VerifierVerdict.parse(vr.content());
+            if (verdict.parsed()) {
+                if ("pass".equalsIgnoreCase(verdict.verdict())) {
+                    job.log("[VERIFIER] PASS — all checklist items satisfied.");
+                } else {
+                    job.log("[VERIFIER] FAIL — items: " + verdict.failedItems()
+                            + (verdict.notes().isBlank() ? "" : " | " + verdict.notes()));
+                    job.log("[VERIFIER] The patch was applied and pushed, but the operator should inspect "
+                            + "the failed checklist items before merging.");
+                }
+            } else {
+                String preview = vr.content().length() > 240
+                        ? vr.content().substring(0, 240) + "…"
+                        : vr.content();
+                job.log("[VERIFIER] Could not parse JSON verdict from model. Raw: " + preview);
+            }
+        } catch (Exception e) {
+            job.log("[VERIFIER] pass skipped — " + e.getMessage());
+        }
+    }
+
+    /**
+     * Returns the Ollama model to use for this run.
+     * Uses the agent's per-profile override ({@link AgentProfile#effectiveOllamaModel()}) if set;
+     * otherwise falls back to the global model from {@link OllamaRuntimeSettings#ollamaModel()}.
+     */
+    private static String resolveModel(AgentProfile agent, OllamaRuntimeSettings cfg) {
+        String perAgent = agent.effectiveOllamaModel();
+        return perAgent.isBlank() ? cfg.ollamaModel() : perAgent;
+    }
+
+    /**
+     * Loads the best available project memory snapshot for the given task/agent combo.
+     * Returns {@code null} if no snapshot exists yet — prompt works normally in that case.
+     */
+    private ProjectMemorySnapshot loadMemoryForTask(AgentTask task, AgentProfile agent) {
+        List<String> repos = repositoryResolver.resolve(task, agent);
+        for (String url : repos) {
+            String norm = GitHubRepoUrls.normalizeHttpsRepositoryUrl(url);
+            if (!norm.isBlank()) {
+                var snapshot = projectMemoryStore.load(norm);
+                if (snapshot.isPresent() && snapshot.get().hasContext()) {
+                    LOG.info("Injecting project memory for Ollama run, repo=" + norm);
+                    return snapshot.get();
+                }
+            }
+        }
+        return null;
     }
 
     private String buildQdrantContext(Path repoRoot, OllamaRuntimeSettings cfg, String collection, AgentTask task)
@@ -413,9 +536,18 @@ public final class OllamaAgentProvider implements AgentProvider {
         volatile String summary = "";
         volatile String error = "";
         volatile String prUrl = "";
+        /** Accumulated real token counts from Ollama model responses (all passes: executor + verifier). */
+        volatile int totalPromptTokens = 0;
+        volatile int totalCompletionTokens = 0;
 
         void log(String m) {
             extraLogs.add(RunLogEntry.now(m));
+        }
+
+        /** Adds token counts from one model call (thread-safe: only called from the job thread). */
+        void addTokens(OllamaHttpClient.OllamaChatResult result) {
+            totalPromptTokens += result.promptEvalCount();
+            totalCompletionTokens += result.evalCount();
         }
 
         AgentRun materialize(AgentRun base) {
@@ -432,7 +564,11 @@ public final class OllamaAgentProvider implements AgentProvider {
             if (st == RunStatus.RUNNING) {
                 sum = base.resultSummary();
             }
-            return base.withLogs(merged).withStatus(st, sum, prUrl == null ? "" : prUrl);
+            AgentRun updated = base.withLogs(merged).withStatus(st, sum, prUrl == null || prUrl.isBlank() ? null : prUrl.strip());
+            if (totalPromptTokens > 0 || totalCompletionTokens > 0) {
+                updated = updated.withTokens(totalPromptTokens, totalCompletionTokens);
+            }
+            return updated;
         }
     }
 }

@@ -27,6 +27,30 @@ public final class GitHubReposClient {
         this.mapper = mapper;
     }
 
+    /**
+     * Lightweight token check via {@code GET /user} (avoids listing all repositories).
+     */
+    public void verifyToken(String accessToken) throws IOException, InterruptedException {
+        if (accessToken == null || accessToken.isBlank()) {
+            throw new IOException("Empty GitHub token");
+        }
+        HttpRequest request = HttpRequest.newBuilder(URI.create("https://api.github.com/user"))
+                .header("Accept", "application/vnd.github+json")
+                .header("Authorization", "Bearer " + accessToken.strip())
+                .header("X-GitHub-Api-Version", "2022-11-28")
+                .GET()
+                .build();
+        HttpResponse<String> response = httpClient.send(request, HttpResponse.BodyHandlers.ofString());
+        if (response.statusCode() == 401 || response.statusCode() == 403) {
+            throw new IOException("GitHub rejected the token (HTTP %d). Sign in again under GitHub settings."
+                    .formatted(response.statusCode()));
+        }
+        if (response.statusCode() != 200) {
+            throw new IOException("GitHub /user HTTP %d: %s".formatted(response.statusCode(),
+                    AppLogging.truncate(response.body(), 2_000)));
+        }
+    }
+
     public List<String> listHttpsRepoUrls(String accessToken) throws IOException, InterruptedException {
         HttpRequest request = HttpRequest.newBuilder(URI.create(LIST_REPOS))
                 .header("Accept", "application/vnd.github+json")

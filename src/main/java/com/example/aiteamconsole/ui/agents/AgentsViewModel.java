@@ -2,7 +2,6 @@ package com.example.aiteamconsole.ui.agents;
 
 import com.example.aiteamconsole.AgentProfile;
 import com.example.aiteamconsole.AgentRole;
-import com.example.aiteamconsole.AgentRun;
 import com.example.aiteamconsole.AgentTask;
 import com.example.aiteamconsole.ProviderType;
 import com.example.aiteamconsole.RepositoryEntry;
@@ -12,7 +11,6 @@ import javafx.beans.property.ObjectProperty;
 import javafx.beans.property.SimpleObjectProperty;
 import javafx.beans.property.SimpleStringProperty;
 import javafx.beans.property.StringProperty;
-import javafx.collections.FXCollections;
 import javafx.collections.ObservableList;
 
 import java.util.ArrayList;
@@ -29,7 +27,8 @@ public final class AgentsViewModel {
     public final StringProperty formName = new SimpleStringProperty("");
     public final ObjectProperty<AgentRole> formRole = new SimpleObjectProperty<>(AgentRole.BACKEND_ENGINEER);
     public final ObjectProperty<ProviderType> formProvider = new SimpleObjectProperty<>(ProviderType.CURSOR_CLOUD);
-    public final ObservableList<String> formTags = FXCollections.observableArrayList();
+    /** Ollama model override. Empty string = use global model from Ollama settings. */
+    public final StringProperty formOllamaModel = new SimpleStringProperty("");
 
     public final ObjectProperty<AgentProfile> selected = new SimpleObjectProperty<>();
 
@@ -47,7 +46,7 @@ public final class AgentsViewModel {
         formName.set(agent.name());
         formRole.set(agent.role());
         formProvider.set(agent.provider());
-        formTags.setAll(agent.repositoryTags());
+        formOllamaModel.set(agent.effectiveOllamaModel());
     }
 
     public MainViewModel main() {
@@ -59,14 +58,15 @@ public final class AgentsViewModel {
         formName.set("");
         formRole.set(AgentRole.BACKEND_ENGINEER);
         formProvider.set(ProviderType.CURSOR_CLOUD);
-        formTags.clear();
+        formOllamaModel.set("");
     }
 
     /**
      * Creates a new profile when nothing is selected; otherwise updates the selected profile.
+     *
+     * @param repositoryTags normalized keys matching {@link RepositoryEntry#tag()} for chosen repos; empty = all repos in registry
      */
-    public void saveAgent(List<String> tagsFromUi) {
-        applyTagsFromUi(tagsFromUi);
+    public void saveAgent(List<String> repositoryTags) {
         String name = formName.get() == null ? "" : formName.get().strip();
         if (name.isBlank()) {
             main.dialogs().showError("Agent name is required.");
@@ -75,22 +75,17 @@ public final class AgentsViewModel {
         AgentRole role = formRole.get();
         ProviderType provider = formProvider.get();
         AgentProfile current = selected.get();
-        List<String> tags = new ArrayList<>(formTags);
+        List<String> tags = main.filterRepositoryTagsToActiveWorkspace(
+                repositoryTags == null ? List.of() : repositoryTags);
+        String ollamaModel = formOllamaModel.get() == null ? "" : formOllamaModel.get().strip();
         if (current == null) {
             AgentProfile agent = AgentProfile.create(
-                    name,
-                    role,
-                    provider,
-                    "",
-                    "",
-                    "",
-                    true,
-                    tags
+                    name, role, provider, "", "", "", true, tags, ollamaModel
             );
             profiles.add(agent);
             clearForm();
         } else {
-            main.replaceAgent(current.withEditableFields(name, role, provider, tags));
+            main.replaceAgent(current.withEditableFields(name, role, provider, tags, ollamaModel));
         }
         main.save();
     }
@@ -121,27 +116,16 @@ public final class AgentsViewModel {
                         task.repositoryUrl(),
                         task.startingRef(),
                         null,
-                        task.repositoryTags()
+                        List.of()
                 ));
             }
         }
         main.save();
     }
 
-    public void applyTagsFromUi(List<String> tagsFromUi) {
-        formTags.clear();
-        if (tagsFromUi != null) {
-            formTags.addAll(tagsFromUi);
-        }
-    }
-
     public boolean isAgentFree(UUID agentId) {
         return main.agentRuns.stream()
                 .filter(run -> run.agentProfileId().equals(agentId))
                 .noneMatch(run -> !run.status().terminal());
-    }
-
-    public List<String> knownTags() {
-        return main.knownTags();
     }
 }

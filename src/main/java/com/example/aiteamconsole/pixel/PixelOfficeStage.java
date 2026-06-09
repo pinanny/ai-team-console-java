@@ -3,7 +3,10 @@ package com.example.aiteamconsole.pixel;
 import com.example.aiteamconsole.AgentProfile;
 import com.example.aiteamconsole.AgentRun;
 import com.example.aiteamconsole.AgentTask;
+import com.example.aiteamconsole.RepositoryEntry;
 import com.example.aiteamconsole.TaskStatus;
+import com.example.aiteamconsole.Workspace;
+import com.example.aiteamconsole.ui.MainViewModel;
 import javafx.animation.AnimationTimer;
 import javafx.collections.ListChangeListener;
 import javafx.collections.ObservableList;
@@ -59,6 +62,8 @@ public final class PixelOfficeStage extends Stage {
 
     private static final long FRAME_MS = 140;
 
+    private final MainViewModel mainViewModel;
+
     private final ObservableList<AgentProfile> agents;
     private final ObservableList<AgentTask> tasks;
     private final ObservableList<AgentRun> runs;
@@ -71,15 +76,11 @@ public final class PixelOfficeStage extends Stage {
     private long lastFrameAt;
     private AnimationTimer timer;
 
-    public PixelOfficeStage(
-            Stage owner,
-            ObservableList<AgentProfile> agents,
-            ObservableList<AgentTask> tasks,
-            ObservableList<AgentRun> runs
-    ) {
-        this.agents = agents;
-        this.tasks = tasks;
-        this.runs = runs;
+    public PixelOfficeStage(Stage owner, MainViewModel mainViewModel) {
+        this.mainViewModel = mainViewModel;
+        this.agents = mainViewModel.agentProfiles;
+        this.tasks = mainViewModel.agentTasks;
+        this.runs = mainViewModel.agentRuns;
 
         initOwner(owner);
         setTitle("Pixel Office");
@@ -97,6 +98,9 @@ public final class PixelOfficeStage extends Stage {
         agents.addListener((ListChangeListener<AgentProfile>) c -> rebuildScene());
         tasks.addListener((ListChangeListener<AgentTask>) c -> render());
         runs.addListener((ListChangeListener<AgentRun>) c -> render());
+        mainViewModel.activeWorkspaceIdProperty().addListener((obs, o, n) -> render());
+        mainViewModel.workspaces.addListener((ListChangeListener<Workspace>) c -> render());
+        mainViewModel.repositories.addListener((ListChangeListener<RepositoryEntry>) c -> render());
 
         timer = new AnimationTimer() {
             @Override
@@ -243,7 +247,7 @@ public final class PixelOfficeStage extends Stage {
             gc.fillText(truncate(title, maxChars + 4), textX, y + 26);
         }
 
-        String assignee = assigneeName(t.assignedAgentId());
+        String assignee = MainViewModel.agentDisplayLabel(t, runs, agents, teamHasPa());
         if (!assignee.isBlank()) {
             gc.setFill(border.darker());
             gc.setFont(Font.font("System", FontWeight.NORMAL, 9));
@@ -257,10 +261,13 @@ public final class PixelOfficeStage extends Stage {
         List<AgentTask> doing = new ArrayList<>();
         List<AgentTask> done = new ArrayList<>();
         for (AgentTask t : tasks) {
+            if (!mainViewModel.taskMatchesActiveWorkspace(t)) {
+                continue;
+            }
             TaskStatus s = t.status();
             if (s == null) continue;
             switch (s) {
-                case DRAFT, QUEUED -> todo.add(t);
+                case DRAFT, OPEN, SPEC_REVIEW, QUEUED -> todo.add(t);
                 case RUNNING, WAITING_REVIEW -> doing.add(t);
                 case DONE, FAILED, CANCELLED -> done.add(t);
             }
@@ -276,14 +283,8 @@ public final class PixelOfficeStage extends Stage {
         return out;
     }
 
-    private String assigneeName(UUID agentId) {
-        if (agentId == null) return "";
-        for (AgentProfile p : agents) {
-            if (Objects.equals(p.id(), agentId)) {
-                return p.name() == null ? "" : p.name();
-            }
-        }
-        return "";
+    private boolean teamHasPa() {
+        return mainViewModel.hasProductAnalystAgent();
     }
 
     private void drawActiveTaskCard(CharacterRender ch) {
@@ -499,6 +500,8 @@ public final class PixelOfficeStage extends Stage {
             case WAITING_REVIEW -> Color.web("#c2a6ff");
             case QUEUED -> Color.web("#6ec1ff");
             case DRAFT -> Color.web("#666");
+            case OPEN -> Color.web("#2e8b7a");
+            case SPEC_REVIEW -> Color.web("#e6a84a");
         };
     }
 
@@ -530,6 +533,7 @@ public final class PixelOfficeStage extends Stage {
             case FINISHED:
                 Optional<AgentTask> task = tasks.stream()
                         .filter(t -> Objects.equals(t.id(), r.taskId()))
+                        .filter(mainViewModel::taskMatchesActiveWorkspace)
                         .findFirst();
                 if (task.isPresent() && task.get().status() == TaskStatus.WAITING_REVIEW) {
                     return CharacterState.WAITING;
@@ -547,12 +551,29 @@ public final class PixelOfficeStage extends Stage {
     private List<AgentTask> tasksFor(UUID agentId) {
         List<AgentTask> out = new ArrayList<>();
         for (AgentTask t : tasks) {
-            if (Objects.equals(t.assignedAgentId(), agentId)) {
+            if (!mainViewModel.taskMatchesActiveWorkspace(t)) {
+                continue;
+            }
+            boolean match = Objects.equals(t.assignedAgentId(), agentId)
+                    || activeRunForAgentOnTask(agentId, t.id());
+            if (match) {
                 out.add(t);
             }
         }
         out.sort(Comparator.comparing(AgentTask::updatedAt).reversed());
         return out;
+    }
+
+    /** True when this agent has the current non-terminal run for {@code taskId}. */
+    private boolean activeRunForAgentOnTask(UUID agentId, UUID taskId) {
+        for (AgentRun r : runs) {
+            if (r.taskId().equals(taskId)
+                    && Objects.equals(r.agentProfileId(), agentId)
+                    && !r.status().terminal()) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private static String truncate(String s, int max) {

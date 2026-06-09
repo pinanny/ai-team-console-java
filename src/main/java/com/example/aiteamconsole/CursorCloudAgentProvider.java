@@ -21,7 +21,13 @@ import java.util.regex.Pattern;
 
 public final class CursorCloudAgentProvider implements AgentProvider {
 
-    /** Cursor Cloud Agents API model id for Composer 2 (fixed in app; not user-configurable). */
+    /**
+     * Legacy default model ID — kept for reference only.
+     * The actual model sent to the API is now taken from {@link AppSettings#cursorCloudModelId()}.
+     * When that field is blank the model field is omitted entirely (Cursor uses its account default).
+     * @deprecated configure via Settings → Cursor → Model ID instead
+     */
+    @Deprecated
     public static final String CURSOR_CLOUD_MODEL_ID = "composer-2";
 
     private static final Logger LOG = AppLogging.get(CursorCloudAgentProvider.class);
@@ -31,9 +37,20 @@ public final class CursorCloudAgentProvider implements AgentProvider {
     );
     private static final String VERIFY_LOG_PREFIX = "Role profile verified by Cloud Agent: ";
 
+    /**
+     * Written to the run log when a PROJECT_MEMORY onboarding run starts.
+     * Detected in {@link #refreshRun} so the provider can auto-save the snapshot after completion
+     * without the caller needing to know it was a special run.
+     */
+    public static final String MEMORY_ONBOARDING_LOG_PREFIX = "[MEMORY-ONBOARDING] repo=";
+
+    /** Written to the run log once memory has been successfully saved. Prevents duplicate saves. */
+    private static final String MEMORY_SAVED_LOG = "[MEMORY-ONBOARDING] snapshot saved";
+
     private final HttpClient httpClient;
     private final ObjectMapper mapper;
     private volatile RepositoryResolver repositoryResolver = RepositoryResolver.DEFAULT;
+    private volatile ProjectMemoryStore projectMemoryStore = ProjectMemoryStore.defaultStore();
 
     public CursorCloudAgentProvider() {
         this(HttpClient.newHttpClient(), new ObjectMapper());
@@ -51,8 +68,17 @@ public final class CursorCloudAgentProvider implements AgentProvider {
         this.repositoryResolver = resolver == null ? RepositoryResolver.DEFAULT : resolver;
     }
 
+    /**
+     * Overrides the project memory store (e.g. for a tenant-specific storage path or in tests).
+     * Defaults to {@link ProjectMemoryStore#defaultStore()}.
+     */
+    public void setProjectMemoryStore(ProjectMemoryStore store) {
+        this.projectMemoryStore = store == null ? ProjectMemoryStore.defaultStore() : store;
+    }
+
     @Override
-    public AgentRun startTask(AgentProfile agent, AgentTask task, AppSettings rawSettings) throws AgentProviderException {
+    public AgentRun startTask(AgentProfile agent, AgentTask task, AppSettings rawSettings, TaskLaunchHints hints) throws AgentProviderException {
+        TaskLaunchHints h = hints == null ? TaskLaunchHints.none() : hints;
         AppSettings settings = requireApiKey(rawSettings);
         List<String> resolvedRepos = new ArrayList<>();
         for (String url : repositoryResolver.resolve(task, agent)) {
@@ -71,10 +97,18 @@ public final class CursorCloudAgentProvider implements AgentProvider {
         AgentBranchNames.HeadBranchResolution headBranch = AgentBranchNames.resolveHeadBranch(agent, task);
         String requestedBranchName = headBranch.requestedRaw();
         String branchNameForApi = headBranch.effectiveForGitAndApi();
+        String headOverride = h.cursorHeadBranchOverride();
+        if (headOverride != null && !headOverride.isBlank()) {
+            branchNameForApi = headOverride.strip();
+            requestedBranchName = branchNameForApi;
+            LOG.info("startTask using head branch override for Cursor API: %s".formatted(branchNameForApi));
+        }
         if (!branchNameForApi.equals(requestedBranchName)) {
             LOG.info("startTask branchName sanitized for Cursor API: '%s' -> '%s'"
                     .formatted(requestedBranchName, branchNameForApi));
         }
+
+        boolean reviewExistingPr = h.pullRequestReviewFocusUrl() != null && !h.pullRequestReviewFocusUrl().isBlank();
 
         LOG.info("startTask taskId=%s taskKey=%s title=%s agentId=%s repos=%s startingRef=%s branchName=%s"
                 .formatted(task.id(), task.taskKey(), task.title(), agent.id(), resolvedRepos,
@@ -97,14 +131,24 @@ public final class CursorCloudAgentProvider implements AgentProvider {
             }
 
             Map<String, Object> body = new LinkedHashMap<>();
-            body.put("prompt", Map.of("text", buildPrompt(agent, task, refAttempt, branchNameForApi)));
+            body.put("prompt", Map.of("text", buildPrompt(agent, task, refAttempt, branchNameForApi, h)));
             body.put("repos", repos);
             if (!branchNameForApi.isBlank()) {
                 body.put("branchName", branchNameForApi);
             }
-            body.put("autoCreatePR", agent.autoCreatePr());
-            body.put("skipReviewerRequest", false);
-            body.put("model", Map.of("id", CURSOR_CLOUD_MODEL_ID));
+            // Memory onboarding, PA spec runs, and Implementation Planner runs never create a PR —
+            // they produce analysis/plan text only. Post-PR review runs target an existing PR;
+            // never open another from this agent.
+            boolean noCodeRoles = agent.role() == AgentRole.PRODUCT_ANALYST
+                    || agent.role() == AgentRole.PROJECT_MEMORY
+                    || agent.role() == AgentRole.IMPLEMENTATION_PLANNER
+                    || reviewExistingPr;
+            body.put("autoCreatePR", noCodeRoles ? false : agent.autoCreatePr());
+            body.put("skipReviewerRequest", reviewExistingPr);
+            // Only include model field if explicitly configured — omitting lets Cursor use its default.
+            if (settings.hasCursorModelId()) {
+                body.put("model", Map.of("id", settings.cursorCloudModelId()));
+            }
 
             LOG.info("createAgent attempt startingRefAttempt=%s".formatted(refAttempt.isBlank() ? "(none)" : refAttempt));
             try {
@@ -160,13 +204,24 @@ public final class CursorCloudAgentProvider implements AgentProvider {
                 .formatted(externalAgentId, externalRunId,
                         resolvedStartingRef.isBlank() ? "(default)" : resolvedStartingRef));
 
+        // Estimate input tokens from the prompt we sent (chars / 4 ≈ tokens, ~10% error)
+        String sentPrompt = buildPrompt(agent, task, resolvedStartingRef, branchNameForApi, h);
+        int estimatedInputTokens = sentPrompt.length() / 4;
+
         AgentRun run = AgentRun.started(task.id(), agent.id(), ProviderType.CURSOR_CLOUD, externalAgentId, externalRunId, branchNameForApi)
+                .withTokens(estimatedInputTokens, 0)   // output tokens updated when run finishes
                 .appendLog("Repository URLs sent to Cursor: " + String.join(", ", resolvedRepos))
                 .appendLog("Starting ref sent to Cursor: " + (resolvedStartingRef.isBlank() ? "(omitted, use repo default)" : resolvedStartingRef))
                 .appendLog("Requested branch name: " + branchNameForApi + headBranch.mismatchNoteForLogs())
+                .appendLog("~%d input tokens (estimated from prompt length)".formatted(estimatedInputTokens))
                 .appendLog("Cursor Cloud Agent accepted the task.");
         if (startedWithoutBranchName) {
             run = run.appendLog("Cursor API rejected branchName; retried without the field. The required branch name remains in the agent prompt.");
+        }
+        // Mark memory onboarding runs so refreshRun can auto-save the snapshot on completion.
+        if (agent.role() == AgentRole.PROJECT_MEMORY) {
+            run = run.appendLog(MEMORY_ONBOARDING_LOG_PREFIX + primaryRepoUrl);
+            LOG.info("startTask: PROJECT_MEMORY onboarding run started for repo=" + primaryRepoUrl);
         }
         return run;
     }
@@ -182,7 +237,8 @@ public final class CursorCloudAgentProvider implements AgentProvider {
         );
         RunStatus status = RunStatus.fromCursorStatus(readText(json, "status"));
         String summary = firstNonBlank(readText(json, "result", "text"), readText(json, "result"), run.resultSummary());
-        String prUrl = firstNonBlank(readPullRequestUrlFromRunJson(json), run.pullRequestUrl());
+        String fromApi = readPullRequestUrlFromRunJson(json);
+        String prUrl = fromApi.isBlank() ? null : fromApi;
         String headFromApi = readHeadBranchFromRunJson(json);
         AgentRun runWithHead = run.withExpectedHeadBranch(
                 firstNonBlank(headFromApi, run.expectedHeadBranch())
@@ -194,10 +250,18 @@ public final class CursorCloudAgentProvider implements AgentProvider {
                 activity
         ));
         AgentRun refreshed = runWithHead.withStatus(status, summary, prUrl);
+        // Update output token estimate when run reaches a terminal state
+        if (status.terminal() && refreshed.estimatedOutputTokens() == 0 && !summary.isBlank()) {
+            int outputEst = summary.length() / 4;
+            refreshed = refreshed.withTokens(refreshed.estimatedInputTokens(), outputEst);
+        }
         if (!lastLogMessage(refreshed).equals(activity)) {
             refreshed = refreshed.appendLog(activity);
         }
-        return maybeAppendVerificationLog(refreshed, json);
+        refreshed = maybeAppendVerificationLog(refreshed, json);
+        // Auto-save project memory snapshot when a PROJECT_MEMORY onboarding run completes.
+        refreshed = maybeSaveProjectMemory(refreshed);
+        return refreshed;
     }
 
     /**
@@ -221,6 +285,51 @@ public final class CursorCloudAgentProvider implements AgentProvider {
             }
         }
         return run.appendLog(logLine);
+    }
+
+    /**
+     * When a PROJECT_MEMORY onboarding run transitions to a terminal success status,
+     * extracts the structured markdown from the result summary and persists it via
+     * {@link ProjectMemoryStore}. Idempotent: skips if already saved (detects log marker).
+     */
+    private AgentRun maybeSaveProjectMemory(AgentRun run) {
+        // Only act on terminal successful runs (FINISHED = success in Cursor API)
+        if (run.status() != RunStatus.FINISHED) {
+            return run;
+        }
+        // Check for the onboarding marker in logs
+        String repoUrl = null;
+        boolean alreadySaved = false;
+        for (RunLogEntry entry : run.logs()) {
+            if (entry.message().startsWith(MEMORY_ONBOARDING_LOG_PREFIX)) {
+                repoUrl = entry.message().substring(MEMORY_ONBOARDING_LOG_PREFIX.length()).strip();
+            }
+            if (MEMORY_SAVED_LOG.equals(entry.message())) {
+                alreadySaved = true;
+            }
+        }
+        if (repoUrl == null || alreadySaved) {
+            return run; // not an onboarding run, or already persisted
+        }
+        ProjectMemorySnapshot snapshot =
+                AgentTaskPrompts.extractMultiLevelProjectMemory(repoUrl, run.resultSummary());
+        if (!snapshot.hasContext()) {
+            LOG.warning("PROJECT_MEMORY run completed but output contained no ## PROJECT_MEMORY_START marker. "
+                    + "Memory not saved for repo=" + repoUrl);
+            return run.appendLog("[MEMORY-ONBOARDING] WARNING: output did not contain PROJECT_MEMORY markers — snapshot not saved. "
+                    + "Re-run the onboarding task.");
+        }
+        try {
+            projectMemoryStore.save(snapshot);
+            LOG.info("PROJECT_MEMORY snapshot saved for repo=" + repoUrl
+                    + " (brief=" + snapshot.briefContext().length()
+                    + " chars, core=" + snapshot.coreContext().length()
+                    + " chars, extended=" + snapshot.extendedContext().length() + " chars)");
+            return run.appendLog(MEMORY_SAVED_LOG);
+        } catch (Exception e) {
+            LOG.warning("Failed to save PROJECT_MEMORY snapshot for repo=" + repoUrl + ": " + e.getMessage());
+            return run.appendLog("[MEMORY-ONBOARDING] ERROR saving snapshot: " + e.getMessage());
+        }
     }
 
     private static String collectSummaryLikeText(JsonNode json) {
@@ -515,8 +624,51 @@ public final class CursorCloudAgentProvider implements AgentProvider {
         return settings;
     }
 
-    private String buildPrompt(AgentProfile agent, AgentTask task, String refSentToCursor, String requiredBranchName) {
-        return AgentTaskPrompts.buildCursorStyleTaskPrompt(agent, task, refSentToCursor, requiredBranchName);
+    /**
+     * Builds the prompt for a task run:
+     * <ul>
+     *   <li>For {@link AgentRole#PROJECT_MEMORY}: uses the one-time onboarding prompt — no role profile,
+     *       no branch, just a structured analysis request. The agent is expected to return
+     *       a markdown block wrapped in {@code ## PROJECT_MEMORY_START / ## PROJECT_MEMORY_END}.</li>
+     *   <li>For all other roles: loads the pre-analyzed project memory from {@link ProjectMemoryStore}
+     *       (if available) and injects it into the standard task prompt so agents skip full codebase
+     *       re-analysis on each run.</li>
+     * </ul>
+     */
+    private String buildPrompt(AgentProfile agent, AgentTask task, String refSentToCursor, String requiredBranchName, TaskLaunchHints hints) {
+        if (agent.role() == AgentRole.PROJECT_MEMORY) {
+            // Determine the primary repo URL for the onboarding prompt
+            List<String> repos = repositoryResolver.resolve(task, agent);
+            String primaryRepo = repos.isEmpty() ? task.repositoryUrl() : repos.get(0);
+            return AgentTaskPrompts.buildProjectMemoryOnboardingPrompt(
+                    GitHubRepoUrls.normalizeHttpsRepositoryUrl(primaryRepo)
+            );
+        }
+        // For normal runs: inject pre-analyzed project memory to avoid full codebase re-analysis
+        ProjectMemorySnapshot memory = resolveMemoryForTask(task, agent);
+        String prFocus = hints == null ? null : hints.pullRequestReviewFocusUrl();
+        return AgentTaskPrompts.buildCursorStyleTaskPrompt(agent, task, refSentToCursor, requiredBranchName, memory, prFocus);
+    }
+
+    /**
+     * Loads the best available project memory snapshot for the given task.
+     * Tries the task's own repo URL first, then falls back to the agent's default repo.
+     * Returns {@code null} if no snapshot is found (prompt will work without it).
+     */
+    private ProjectMemorySnapshot resolveMemoryForTask(AgentTask task, AgentProfile agent) {
+        List<String> repos = repositoryResolver.resolve(task, agent);
+        for (String url : repos) {
+            String norm = GitHubRepoUrls.normalizeHttpsRepositoryUrl(url);
+            if (!norm.isBlank()) {
+                var snapshot = projectMemoryStore.load(norm);
+                if (snapshot.isPresent() && snapshot.get().hasContext()) {
+                    LOG.info("Injecting project memory for repo=" + norm
+                            + " (updated=" + snapshot.get().lastUpdatedAt() + ")");
+                    return snapshot.get();
+                }
+            }
+        }
+        return null; // no memory yet — prompt works normally, agents will analyze from scratch
     }
 
     private static List<String> startingRefAttempts(String startingRef) {
@@ -576,6 +728,10 @@ public final class CursorCloudAgentProvider implements AgentProvider {
         return URLEncoder.encode(value, StandardCharsets.UTF_8);
     }
 
+    private static final Pattern GITHUB_PR_URL_PATTERN = Pattern.compile(
+            "https://github\\.com/[^\\s\"'<>]+?/pull/\\d+[^\\s\"'<>]*",
+            Pattern.CASE_INSENSITIVE);
+
     /**
      * Cursor run JSON shape varies by API version; collect likely locations for a PR link.
      */
@@ -583,6 +739,9 @@ public final class CursorCloudAgentProvider implements AgentProvider {
         return firstNonBlank(
                 readText(json, "pullRequestUrl"),
                 readText(json, "prUrl"),
+                readText(json, "run", "pullRequestUrl"),
+                readText(json, "data", "pullRequestUrl"),
+                readText(json, "target", "pullRequestUrl"),
                 readText(json, "pullRequest", "html_url"),
                 readText(json, "pullRequest", "url"),
                 readText(json, "pull_request", "html_url"),
@@ -591,8 +750,46 @@ public final class CursorCloudAgentProvider implements AgentProvider {
                 readText(json, "result", "prUrl"),
                 readText(json, "output", "pullRequestUrl"),
                 readText(json, "githubPullRequestUrl"),
-                readText(json, "pr", "html_url")
+                readText(json, "pr", "html_url"),
+                scanJsonTreeForGithubPullUrl(json)
         );
+    }
+
+    /**
+     * Last resort: any JSON string containing a GitHub {@code /pull/<n>} URL
+     * (some API versions embed the link only in summary/activity text).
+     */
+    private static String scanJsonTreeForGithubPullUrl(JsonNode node) {
+        return scanJsonTreeForGithubPullUrl(node, 0, 16);
+    }
+
+    private static String scanJsonTreeForGithubPullUrl(JsonNode node, int depth, int maxDepth) {
+        if (node == null || node.isNull() || depth > maxDepth) {
+            return "";
+        }
+        if (node.isTextual()) {
+            Matcher m = GITHUB_PR_URL_PATTERN.matcher(node.asText());
+            return m.find() ? m.group().strip() : "";
+        }
+        if (node.isArray()) {
+            for (JsonNode el : node) {
+                String u = scanJsonTreeForGithubPullUrl(el, depth + 1, maxDepth);
+                if (!u.isBlank()) {
+                    return u;
+                }
+            }
+            return "";
+        }
+        if (node.isObject()) {
+            var fields = node.fields();
+            while (fields.hasNext()) {
+                String u = scanJsonTreeForGithubPullUrl(fields.next().getValue(), depth + 1, maxDepth);
+                if (!u.isBlank()) {
+                    return u;
+                }
+            }
+        }
+        return "";
     }
 
     /**

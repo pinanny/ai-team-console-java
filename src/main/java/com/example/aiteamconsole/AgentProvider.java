@@ -1,7 +1,12 @@
 package com.example.aiteamconsole;
 
 public interface AgentProvider {
-    AgentRun startTask(AgentProfile agent, AgentTask task, AppSettings settings) throws AgentProviderException;
+    default AgentRun startTask(AgentProfile agent, AgentTask task, AppSettings settings) throws AgentProviderException {
+        return startTask(agent, task, settings, TaskLaunchHints.none());
+    }
+
+    AgentRun startTask(AgentProfile agent, AgentTask task, AppSettings settings, TaskLaunchHints hints)
+            throws AgentProviderException;
 
     AgentRun refreshRun(AgentRun run, AppSettings settings) throws AgentProviderException;
 
